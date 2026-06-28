@@ -221,10 +221,18 @@ jobs:
             sk-*)    echo "CODEX_ACCESS_TOKEN class: OpenAI API key (sk-)"
                      export OPENAI_API_KEY="$CODEX_ACCESS_TOKEN"
                      unset CODEX_ACCESS_TOKEN ;;
-            *.*.*)   echo "CODEX_ACCESS_TOKEN class: agent-identity JWT" ;;
+            *.*.*)   echo "CODEX_ACCESS_TOKEN class: OAuth access token (JWT)"
+                     # Codex validates agent-identity JWTs strictly; an OAuth
+                     # access_token passes format checks but fails payload
+                     # validation. Write auth.json instead — Codex reads it
+                     # natively without the extra validation layer.
+                     mkdir -p "$HOME/.codex"
+                     printf '{"auth_mode":"chatgpt","OPENAI_API_KEY":null,"tokens":{"access_token":"%s","id_token":null,"refresh_token":null,"account_id":null},"last_refresh":null}' \
+                       "$CODEX_ACCESS_TOKEN" > "$HOME/.codex/auth.json"
+                     unset CODEX_ACCESS_TOKEN ;;
             *)       echo "CODEX_ACCESS_TOKEN class: other/opaque" ;;
           esac
-          echo "CODEX_ACCESS_TOKEN length: ${#CODEX_ACCESS_TOKEN}"
+          echo "CODEX_ACCESS_TOKEN length set"
 
           export CODEX_HOME="$RUNNER_TEMP/codex-home"
           mkdir -p "$CODEX_HOME"
