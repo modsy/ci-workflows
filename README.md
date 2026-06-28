@@ -13,27 +13,28 @@ lives here.
 
 | Workflow | What it does |
 |---|---|
-| [`claude-pr-review.yml`](.github/workflows/claude-pr-review.yml) | AI code review on every PR push using the Claude API. Posts a structured PR review with inline diff annotations, identical in behavior to GitHub Copilot code review. |
+| [`codex-pr-review.yml`](.github/workflows/codex-pr-review.yml) | AI code review on every PR push using OpenAI Codex. Posts a structured PR review with inline diff annotations, identical in behavior to GitHub Copilot code review. |
 
 ---
 
-## `claude-pr-review` — AI PR Review
+## `codex-pr-review` — AI PR Review
 
 ### How it works
 
 1. A service repo's caller workflow triggers on `pull_request` (or
    `pull_request_target` for repos with fork PRs).
 2. The caller invokes this shared workflow via
-   `uses: modsy/ci-workflows/.github/workflows/claude-pr-review.yml@main`.
+   `uses: modsy/ci-workflows/.github/workflows/codex-pr-review.yml@main`.
 3. The shared workflow:
    - Checks out the PR's merge commit (`refs/pull/N/merge`) with
      `persist-credentials: false`.
    - Fetches PR metadata, the full diff, and any linked issues.
    - Optionally runs a `pre_install_command` (e.g. `npm ci`) and reports
      the outcome in the prompt.
-   - Reads a custom review prompt from `.github/claude/prompts/pr-review.md`
+   - Reads a custom review prompt from `.github/codex/prompts/codex-pr-review.md`
      in the caller repo (or falls back to a sensible built-in default).
-   - Calls the Anthropic Messages API and parses the structured JSON response.
+   - Runs Codex CLI (`@openai/codex`) in ephemeral sandbox mode.
+   - Parses the structured JSON response between `BEGIN_REVIEW_JSON` / `END_REVIEW_JSON` markers.
    - Posts the result as a PR review (verdict + inline diff comments) via
      `github.rest.pulls.createReview` — the same API used by GitHub Copilot.
 
@@ -41,27 +42,35 @@ lives here.
 
 | Concern | How it is addressed |
 |---|---|
-| Secrets isolation | `ANTHROPIC_API_KEY` is stored in each org or repo and passed explicitly at call time. It is never stored here. |
+| Secrets isolation | `CODEX_ACCESS_TOKEN` / `CODEX_AUTH_JSON` are stored in each org or repo and passed explicitly at call time. Never stored here. |
 | Fork PR exfiltration | Callers using `pull_request_target` MUST include the fork guard shown in the examples (`if:` on the job; never on a separate prerequisite job). |
-| Prompt privacy | The review prompt lives in each caller repo at `.github/claude/prompts/pr-review.md` and is read at runtime. |
+| Prompt privacy | The review prompt lives in each caller repo at `.github/codex/prompts/codex-pr-review.md` and is read at runtime. |
 | Credential leak via git | `persist-credentials: false` removes `GITHUB_TOKEN` from the git config so scripts cannot use it to push or fetch. |
 | Script injection | All GitHub context values are passed to shell via environment variables, never interpolated directly into `run:` scripts. |
-| Diff injection | The diff is embedded in the prompt via `jq` string encoding before the API call, not via shell substitution. |
+| Sandbox | Codex runs with `--ephemeral --sandbox workspace-write` — ephemeral container, no persistent state, write access scoped to the workspace only. |
 
 ### Inputs
 
 | Input | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `pr_number` | number | No | auto | PR number to review. Auto-resolved from the event; pass explicitly for `workflow_dispatch`. |
-| `model` | string | No | `claude-sonnet-4-6` | Anthropic model ID. Pin this in your caller for reproducible reviews. |
-| `max_tokens` | number | No | `4096` | Maximum tokens in the model response. |
-| `pre_install_command` | string | No | `""` | Shell command to run before the review (e.g. `npm ci`). Runs with `continue-on-error`; outcome is reported in the prompt. |
+| `codex_version` | string | No | `0.142.0` | Pinned version of `@openai/codex` to install. Pin this in your caller for reproducible reviews. |
+| `pre_install_command` | string | No | `""` | Shell command to run before the review (e.g. `npm ci && npm run build --workspaces --if-present`). Runs with `continue-on-error`; outcome is reported in the prompt. |
 
 ### Secrets
 
 | Secret | Required | Description |
 |---|---|---|
-| `ANTHROPIC_API_KEY` | Yes | Anthropic API key with access to the chosen model. Store as an org-level secret scoped to repos that use it, or as a repo-level secret. |
+| `CODEX_ACCESS_TOKEN` | One of these is required | Personal access token (`at-*`), OpenAI API key (`sk-*`), or ChatGPT OAuth JWT. |
+| `CODEX_AUTH_JSON` | One of these is required | Full `auth.json` content from `~/.codex/auth.json`. Preferred over `CODEX_ACCESS_TOKEN` for ChatGPT Business/Enterprise accounts because it includes the refresh token, allowing Codex to route through `chatgpt.com`. |
+
+Obtain `CODEX_AUTH_JSON` from your local machine after authenticating Codex:
+
+```bash
+cat ~/.codex/auth.json
+```
+
+Store the entire JSON blob as the `CODEX_AUTH_JSON` secret.
 
 ### Outputs
 
@@ -75,37 +84,99 @@ lives here.
 
 ### Step 1 — Add the secret
 
-Add **`ANTHROPIC_API_KEY`** as a secret in your org or repo:
+Add **`CODEX_AUTH_JSON`** (preferred) or **`CODEX_ACCESS_TOKEN`** as a secret in your repo:
 
-- **Org-level** (recommended — shared across all repos that need it):
-  `GitHub org > Settings > Secrets and variables > Actions > New org secret`
 - **Repo-level**: `Repo > Settings > Secrets and variables > Actions > New repository secret`
+- **Org-level** (shared): `GitHub org > Settings > Secrets and variables > Actions > New org secret`
 
-The key must have access to the model specified in the `model` input
-(default: `claude-sonnet-4-6`). Obtain it from
-[console.anthropic.com](https://console.anthropic.com) under API Keys.
+For ChatGPT Business or Enterprise accounts (Lennar), use `CODEX_AUTH_JSON` with the
+full `~/.codex/auth.json` content. This gives Codex a refresh token so it can
+stay authenticated through chatgpt.com rather than hitting `api.openai.com/v1/responses`
+directly (which requires different scopes).
 
 ### Step 2 — Add the caller workflow
 
-Pick the template that matches your situation:
+Create `.github/workflows/pr-review.yml` in your service repo:
 
-| Template | Use when |
-|---|---|
-| [`examples/pr-review-internal.yml`](examples/pr-review-internal.yml) | All contributors have push access to the repo (no fork PRs). Simpler, safer. |
-| [`examples/pr-review-with-fork-guard.yml`](examples/pr-review-with-fork-guard.yml) | Repo receives PRs from forks (open source or cross-org). Includes mandatory fork guard. |
+```yaml
+name: PR Review
 
-Copy the relevant file to `.github/workflows/pr-review.yml` in your service
-repo. Adjust `pre_install_command` for your stack.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to review"
+        required: true
+        type: number
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: codex-pr-review-${{ github.event.pull_request.number || inputs.pr_number }}
+  cancel-in-progress: false
+
+jobs:
+  codex-review:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+       github.event.pull_request.draft == false)
+
+    uses: modsy/ci-workflows/.github/workflows/codex-pr-review.yml@main
+
+    with:
+      pr_number: ${{ github.event.pull_request.number || inputs.pr_number }}
+      pre_install_command: "npm ci"   # adjust for your stack
+      codex_version: "0.142.0"
+
+    secrets:
+      CODEX_ACCESS_TOKEN: ${{ secrets.CODEX_ACCESS_TOKEN }}
+      CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
+```
+
+For Python services, set `pre_install_command: ""` (no install needed before Codex runs).
+
+For Node/frontend monorepos with workspace packages, build them too:
+
+```yaml
+pre_install_command: "npm ci && npm run build --workspaces --if-present"
+```
 
 ### Step 3 — Add a custom prompt (recommended)
 
-Create `.github/claude/prompts/pr-review.md` in your repo. This is your
+Create `.github/codex/prompts/codex-pr-review.md` in your repo. This is your
 private, stack-specific review instruction set read at runtime.
 
-Start from the template: [`examples/prompt-template.md`](examples/prompt-template.md).
+The prompt must:
+1. Describe the stack (frameworks, testing libraries, conventions).
+2. List the review dimensions (correctness, security, performance, etc.).
+3. Instruct Codex to output JSON between `BEGIN_REVIEW_JSON` and `END_REVIEW_JSON` markers
+   with this shape:
 
-If you omit this file, a built-in default is used. Custom prompts consistently
-produce better, more focused results.
+```json
+{
+  "verdict": "APPROVE" | "REQUEST_CHANGES" | "COMMENT",
+  "summary": "One paragraph review summary.",
+  "comments": [
+    {
+      "path": "relative/path/to/file.ts",
+      "line": 42,
+      "body": "Inline comment text."
+    }
+  ]
+}
+```
+
+If you omit the prompt file, a built-in default is used. Custom prompts produce
+significantly better, more focused results for your specific stack.
+
+See [`timmy/`'s prompt](https://github.com/modsy/timmy/blob/main/.github/codex/prompts/codex-pr-review.md) as a reference implementation.
 
 ### Step 4 — Open a test PR
 
@@ -123,51 +194,49 @@ Push a branch, open a PR, and confirm that:
 supply-chain safety.
 
 ```yaml
-uses: modsy/ci-workflows/.github/workflows/claude-pr-review.yml@<sha>
+uses: modsy/ci-workflows/.github/workflows/codex-pr-review.yml@<sha>
 ```
 
 **Acceptable for low-risk teams:** pin to `@main` to always get the latest.
 
 ```yaml
-uses: modsy/ci-workflows/.github/workflows/claude-pr-review.yml@main
+uses: modsy/ci-workflows/.github/workflows/codex-pr-review.yml@main
 ```
-
-Never pin to a mutable tag (`@v1`) without a corresponding branch protection
-rule — mutable tags can be force-pushed.
 
 ---
 
 ## Troubleshooting
 
 **Review does not appear**
-- Check the Actions run logs for the `claude-review` job.
-- Confirm `ANTHROPIC_API_KEY` is set and scoped to the repo.
-- Confirm the caller passes `secrets: ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}`.
+- Check the Actions run logs for the `codex-review` job.
+- Confirm `CODEX_AUTH_JSON` or `CODEX_ACCESS_TOKEN` is set and scoped to the repo.
+- Check the "Authenticate Codex" step for error messages.
+
+**401 from api.openai.com/v1/responses**
+- Your token is routing to the OpenAI API directly but lacks `api.responses.write` scope.
+- Use `CODEX_AUTH_JSON` (full auth.json with refresh_token) instead of `CODEX_ACCESS_TOKEN`.
+- The full auth.json causes Codex to route through `chatgpt.com`, which has the correct scope.
+
+**"invalid agent identity JWT format"**
+- The value stored in `CODEX_ACCESS_TOKEN` is not a valid JWT or PAT format.
+- Use `CODEX_AUTH_JSON` with the full auth.json blob instead.
 
 **"Cannot resolve a PR number"**
 - When calling via `workflow_dispatch`, you must pass `pr_number` as an input.
-
-**Anthropic API returned HTTP 401**
-- The `ANTHROPIC_API_KEY` value is invalid or has been revoked. Rotate the key
-  in console.anthropic.com and update the secret.
-
-**Anthropic API returned HTTP 429**
-- Rate limit hit. The workflow will fail and GitHub will not auto-retry it. Re-run
-  the failed job from the Actions UI once the limit clears.
 
 **Fork PRs are not reviewed**
 - Intentional for repos using `pull_request_target`. Fork PRs are blocked by the
   fork guard to prevent secret exfiltration. A maintainer can manually trigger a
   review via `workflow_dispatch` after inspecting the fork.
 
-**Review runs on draft PRs**
-- The caller templates skip drafts via the `if:` condition. If you copied an
-  older version without the draft check, add
-  `github.event.pull_request.draft == false` to your job `if:`.
-
 **`pre_install_command` fails**
 - Installation failures are `continue-on-error`. The prompt reports the outcome
-  so Claude knows which tools are available. Fix the command and push a new commit.
+  so Codex knows which tools are available. Fix the command and push a new commit.
+- For monorepos with workspace packages, build them: `npm ci && npm run build --workspaces --if-present`.
+
+**bubblewrap / sandbox errors**
+- The workflow automatically runs `sysctl -w kernel.unprivileged_userns_clone=1`
+  for Linux runners. This is required for Codex's bubblewrap sandbox.
 
 ---
 
