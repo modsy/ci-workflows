@@ -34,10 +34,18 @@ on:
     secrets:
       CODEX_ACCESS_TOKEN:
         description: >
-          Agent-identity JWT for the Codex CLI. Obtain by running
-          `codex auth` locally and copying the JWT from ~/.codex/auth.json.
-          Store as an org or repo secret.
-        required: true
+          OpenAI API key (sk-*), agent-identity JWT, or personal access token
+          (at-*) for the Codex CLI. For ChatGPT Business/Plus accounts, use
+          CODEX_AUTH_JSON instead.
+        required: false
+
+      CODEX_AUTH_JSON:
+        description: >
+          Full contents of ~/.codex/auth.json from a machine where `codex auth`
+          has been run. Preferred over CODEX_ACCESS_TOKEN for ChatGPT accounts
+          because it includes the refresh token Codex uses to maintain sessions.
+          Obtain with: cat ~/.codex/auth.json
+        required: false
 
     outputs:
       review_url:
@@ -203,6 +211,7 @@ jobs:
         shell: bash
         env:
           CODEX_ACCESS_TOKEN: ${{ secrets.CODEX_ACCESS_TOKEN }}
+          CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
           PR_NUMBER: ${{ steps.pr.outputs.number }}
           BASE_REF: ${{ steps.context.outputs.base_ref }}
           REVIEWED_SHA: ${{ steps.context.outputs.reviewed_sha }}
@@ -211,28 +220,34 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [ -z "${CODEX_ACCESS_TOKEN:-}" ]; then
-            echo "CODEX_ACCESS_TOKEN secret is required." >&2
+          if [ -z "${CODEX_ACCESS_TOKEN:-}" ] && [ -z "${CODEX_AUTH_JSON:-}" ]; then
+            echo "Either CODEX_ACCESS_TOKEN or CODEX_AUTH_JSON secret is required." >&2
             exit 1
           fi
 
-          case "$CODEX_ACCESS_TOKEN" in
-            at-*)    echo "CODEX_ACCESS_TOKEN class: personal access token (at-)" ;;
-            sk-*)    echo "CODEX_ACCESS_TOKEN class: OpenAI API key (sk-)"
+          # Prefer CODEX_AUTH_JSON (full auth.json from `codex auth` — includes
+          # refresh token so Codex can maintain the session in CI).
+          if [ -n "${CODEX_AUTH_JSON:-}" ]; then
+            echo "Auth: writing full auth.json (CODEX_AUTH_JSON)"
+            mkdir -p "$HOME/.codex"
+            printf '%s' "$CODEX_AUTH_JSON" > "$HOME/.codex/auth.json"
+            unset CODEX_ACCESS_TOKEN CODEX_AUTH_JSON
+          else
+            case "$CODEX_ACCESS_TOKEN" in
+              at-*)  echo "Auth: personal access token (at-)" ;;
+              sk-*)  echo "Auth: OpenAI API key (sk-) → OPENAI_API_KEY"
                      export OPENAI_API_KEY="$CODEX_ACCESS_TOKEN"
                      unset CODEX_ACCESS_TOKEN ;;
-            *.*.*)   echo "CODEX_ACCESS_TOKEN class: OAuth access token (JWT)"
-                     # Codex validates agent-identity JWTs strictly; an OAuth
-                     # access_token passes format checks but fails payload
-                     # validation. Write auth.json instead — Codex reads it
-                     # natively without the extra validation layer.
+              *.*.*)
+                     # Full JWT written to auth.json; Codex reads it natively.
+                     echo "Auth: OAuth JWT → auth.json"
                      mkdir -p "$HOME/.codex"
                      printf '{"auth_mode":"chatgpt","OPENAI_API_KEY":null,"tokens":{"access_token":"%s","id_token":null,"refresh_token":null,"account_id":null},"last_refresh":null}' \
                        "$CODEX_ACCESS_TOKEN" > "$HOME/.codex/auth.json"
                      unset CODEX_ACCESS_TOKEN ;;
-            *)       echo "CODEX_ACCESS_TOKEN class: other/opaque" ;;
-          esac
-          echo "CODEX_ACCESS_TOKEN length set"
+              *)     echo "Auth: other/opaque token — passing as CODEX_ACCESS_TOKEN" ;;
+            esac
+          fi
 
           export CODEX_HOME="$RUNNER_TEMP/codex-home"
           mkdir -p "$CODEX_HOME"
