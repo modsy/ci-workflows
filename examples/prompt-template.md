@@ -95,23 +95,27 @@ If there are no issues, say so clearly and approve.
 
 ## Output format
 
-<!-- codex-reviewer -->
-_Codex review of `<sha>`_
+Output your review between the exact markers below as a single valid JSON object.
+Do not wrap in markdown code fences. Do not output anything after END_REVIEW_JSON.
 
-### Verdict
-<Approve | Request changes | Needs discussion> — one sentence.
+BEGIN_REVIEW_JSON
+{
+  "verdict": "APPROVE" | "REQUEST_CHANGES" | "COMMENT",
+  "summary": "One-paragraph plain-text overview. Include: verdict rationale, coverage lenses applied, any tools run (e.g. tsc, pytest), and the reviewed SHA.",
+  "comments": [
+    {
+      "path": "relative/path/to/file.ts",
+      "line": 42,
+      "severity": "blocking" | "suggestion" | "nitpick",
+      "body": "[Blocking] Description of issue and how to fix it."
+    }
+  ]
+}
+END_REVIEW_JSON
 
-### Findings
-
-**Blocking**
-- `path/to/file.py:42` — description. [Correctness]
-
-**Suggestions**
-- `path/to/file.ts:17` — description. [Performance]
-
-**Nitpicks**
-- `path/to/file.py:88` — description. [Style]
-
-### Coverage
-Lenses: correctness, security, performance, reliability, tests, contracts
-Validation: <what you ran — e.g. "pytest (12 passed)", "tsc --noEmit (0 errors)", "none">
+Rules for comments:
+- path must be a real file path from the diff (relative to repo root).
+- line must be a line number that exists in the diff (added or context line on the right side).
+  If you are not certain the line is in the diff, put the finding in summary instead.
+- Prefix each body with the severity: [Blocking], [Suggestion], or [Nitpick].
+- Use an empty array ([]) if there are no inline findings.

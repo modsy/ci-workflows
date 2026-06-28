@@ -2,19 +2,14 @@
 #
 # Codex PR review — for repos with internal contributors only (no fork PRs).
 #
-# Uses the `pull_request` trigger, which runs in the context of the PR branch
-# and does NOT expose repo secrets to fork contributors. No fork guard needed.
+# Triggers mirror GitHub Copilot code review:
+#   opened:            review when a non-draft PR is first opened.
+#   synchronize:       re-review when new commits are pushed.
+#   reopened:          review when a closed PR is reopened.
+#   ready_for_review:  review when a draft PR is marked ready.
 #
-# Trigger choice:
-#   - opened:            review when a PR is first opened (non-draft).
-#   - ready_for_review:  review when a draft PR is marked ready. Pairs with
-#                        the draft skip in the caller template below: a PR
-#                        opened as a draft is skipped at "opened" and reviewed
-#                        once when marked ready.
-#
-# Not included: synchronize (new commits). Add it if you want Codex to re-
-# review on every push. Omitting it keeps costs predictable — one review per
-# PR lifecycle event, not one per push.
+# Remove "synchronize" if you want one review per PR lifecycle event rather
+# than one per push (lower cost, fewer notifications).
 #
 # Copy this file to .github/workflows/pr-review.yml in your service repo.
 # Adjust pre_install_command for your stack (or remove if not needed).
@@ -23,7 +18,7 @@ name: PR Review
 
 on:
   pull_request:
-    types: [opened, ready_for_review]
+    types: [opened, synchronize, reopened, ready_for_review]
 
   workflow_dispatch:
     inputs:
@@ -32,15 +27,12 @@ on:
         required: true
         type: number
 
-# Queue reviews for the same PR; never cancel a review already running.
 concurrency:
   group: codex-pr-review-${{ github.event.pull_request.number || inputs.pr_number }}
   cancel-in-progress: false
 
 jobs:
   codex-review:
-    # Skip draft PRs. When a draft is marked ready, the ready_for_review event
-    # fires and this condition allows it through.
     if: >-
       github.event_name == 'workflow_dispatch' ||
       github.event.pull_request.draft == false
@@ -51,17 +43,12 @@ jobs:
       pr_number: ${{ inputs.pr_number }}
 
       # Optional: install project dependencies before Codex runs.
-      # This lets Codex invoke linters, type-checkers, and test runners.
-      # Remove this line if your review prompt does not need them.
-      #
       # Examples:
       #   Node only:             "npm ci"
       #   Python only:           "pip install -r requirements.txt"
       #   Django + React stack:  "pip install -r requirements.txt && npm ci"
       pre_install_command: ""
 
-      # Pin the Codex version for reproducible reviews.
-      # Check https://www.npmjs.com/package/@openai/codex for the latest release.
       codex_version: "0.142.0"
 
     secrets:
