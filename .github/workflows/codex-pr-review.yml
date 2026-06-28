@@ -1,5 +1,6 @@
 name: Codex PR Review (Reusable)
 # Called by service repos via workflow_call. Never triggered directly.
+# Reference implementation: product-org-len/atlas-pp-sxs-tool-app
 # See examples/ for ready-to-use caller workflows.
 
 on:
@@ -8,40 +9,39 @@ on:
       pr_number:
         description: >
           Pull request number to review. Auto-resolved from the triggering
-          event if omitted. Required when called via workflow_dispatch.
+          event. Required when called via workflow_dispatch.
         required: false
         type: number
 
-      codex_version:
-        description: >
-          @openai/codex npm package version to install. Pin this in your
-          caller for reproducible reviews. Bump deliberately.
-        required: false
-        type: string
-        default: "0.142.0"
-
       pre_install_command:
         description: >
-          Optional shell command executed after checkout and before Codex
-          runs. Use to install project dependencies so Codex can invoke
-          linters, type-checkers, or test runners. Runs with
-          continue-on-error; a failure is logged but does not abort the review.
+          Optional shell command run after checkout, before Codex. Use to
+          install project dependencies. Runs with continue-on-error; the
+          outcome is passed to Codex in the prompt.
         required: false
         type: string
         default: ""
 
+      codex_version:
+        description: >
+          @openai/codex npm version to install. Pin in your caller for
+          reproducible reviews. Bump deliberately.
+        required: false
+        type: string
+        default: "0.142.0"
+
     secrets:
       CODEX_ACCESS_TOKEN:
         description: >
-          Claude Code access token (starts with "at-") or agent-identity JWT.
-          Obtain from claude.ai account settings. Store as an org-level secret
-          scoped to the repos that need it.
+          Agent-identity JWT for the Codex CLI. Obtain by running
+          `codex auth` locally and copying the JWT from ~/.codex/auth.json.
+          Store as an org or repo secret.
         required: true
 
     outputs:
-      review_url:
-        description: "URL of the posted Codex PR review."
-        value: ${{ jobs.codex-review.outputs.review_url }}
+      comment_url:
+        description: "URL of the posted Codex review comment."
+        value: ${{ jobs.codex-review.outputs.comment_url }}
 
 jobs:
   codex-review:
@@ -51,14 +51,12 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
+      issues: write
 
     outputs:
-      review_url: ${{ steps.post_review.outputs.review_url }}
+      comment_url: ${{ steps.post_comment.outputs.comment_url }}
 
     steps:
-      # ---------------------------------------------------------------
-      # 1. Resolve the PR number.
-      # ---------------------------------------------------------------
       - name: Resolve PR number
         id: pr
         shell: bash
@@ -68,21 +66,16 @@ jobs:
         run: |
           set -euo pipefail
           pr_number="${EVENT_PR_NUMBER:-${INPUT_PR_NUMBER:-}}"
-          if [[ -z "$pr_number" ]]; then
-            echo "::error::Cannot resolve a PR number. Pass pr_number as an input when calling via workflow_dispatch." >&2
+          if [ -z "$pr_number" ]; then
+            echo "Unable to resolve a pull request number." >&2
             exit 1
           fi
           if ! [[ "$pr_number" =~ ^[0-9]+$ ]]; then
-            echo "::error::PR number '${pr_number}' is not numeric." >&2
+            echo "Resolved pull request number '$pr_number' is not numeric." >&2
             exit 1
           fi
           echo "number=$pr_number" >> "$GITHUB_OUTPUT"
 
-      # ---------------------------------------------------------------
-      # 2. Check out the PR merge commit.
-      #    persist-credentials: false keeps GITHUB_TOKEN out of the git
-      #    config so Codex cannot use it to push or fetch.
-      # ---------------------------------------------------------------
       - name: Check out PR merge commit
         uses: actions/checkout@v4
         with:
@@ -90,12 +83,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      # ---------------------------------------------------------------
-      # 3. Fetch PR metadata, linked issues, and the head SHA we will
-      #    stamp on the review. SHA is captured before Codex runs so a
-      #    push mid-review cannot mislabel the posted review.
-      # ---------------------------------------------------------------
-      - name: Fetch PR metadata and build context
+      - name: Fetch PR metadata and refs
         id: context
         shell: bash
         env:
@@ -111,38 +99,21 @@ jobs:
 
           base_ref="$(jq -r '.baseRefName' "$pr_json")"
 
-          # Full PR head SHA for createReview commit_id.
-          head_sha="$(git rev-parse 'HEAD^2' 2>/dev/null \
-            || jq -r '.headRefOid' "$pr_json")"
-          reviewed_sha="${head_sha:0:7}"
-
           {
             echo "# Pull request context"
             echo
-            jq -r '"- Number: #\(.number)
-          - URL: \(.url)
-          - Title: \(.title)
-          - Author: \(.author.login)
-          - Base: \(.baseRefName)@\(.baseRefOid)
-          - Head: \(.headRefName)@\(.headRefOid)
-          - Draft: \(.isDraft)"' "$pr_json"
+            jq -r '"- Number: #\(.number)\n- URL: \(.url)\n- Title: \(.title)\n- Author: \(.author.login)\n- Base: \(.baseRefName)@\(.baseRefOid)\n- Head: \(.headRefName)@\(.headRefOid)\n- Draft: \(.isDraft)"' "$pr_json"
             echo
             echo "## Body"
-            jq -r '.body // "(no body)"' "$pr_json"
+            jq -r '.body // ""' "$pr_json"
           } > "$RUNNER_TEMP/pr-context.md"
 
-          # Fetch linked issues.
           pr_text="$(jq -r '"\(.title)\n\(.body // "")"' "$pr_json")"
-          closing_refs="$(printf '%s' "$pr_text" \
-            | grep -oiE '(^|[^a-zA-Z])(close[sd]?|fix(es|ed)?|resolve[ds]?)[[:space:]:]+#[0-9]+' \
-            | grep -oE '[0-9]+' || true)"
-          all_refs="$(printf '%s' "$pr_text" \
-            | grep -oE '(^|[^A-Za-z0-9_/-])#[0-9]+' \
-            | grep -oE '[0-9]+' || true)"
+          closing_refs="$(printf '%s' "$pr_text" | grep -oiE '(^|[^a-zA-Z])(close[sd]?|fix(es|ed)?|resolve[ds]?)[[:space:]:]+#[0-9]+' | grep -oE '[0-9]+' || true)"
+          all_refs="$(printf '%s' "$pr_text" | grep -oE '(^|[^A-Za-z0-9_/-])#[0-9]+' | grep -oE '[0-9]+' || true)"
           refs="$(printf '%s\n%s\n' "$closing_refs" "$all_refs" \
             | awk -v self="$PR_NUMBER" 'NF && $0 != self && !seen[$0]++' \
             | head -n 6)"
-
           linked="$RUNNER_TEMP/linked-issues.md"
           : > "$linked"
           for n in $refs; do
@@ -150,28 +121,25 @@ jobs:
               {
                 echo
                 printf '### Issue #%s\n\n' "$n"
-                printf '%s' "$issue_json" \
-                  | jq -r '"**\(.title)** [\(.state)]\n\n\(.body // "")"'
+                printf '%s' "$issue_json" | jq -r '"**\(.title)** [\(.state)]\n\n\(.body // "")"'
               } >> "$linked"
             fi
           done
-
-          if [[ -s "$linked" ]]; then
+          if [ -s "$linked" ]; then
             head -c 60000 "$linked" > "$linked.cap" && mv "$linked.cap" "$linked"
             {
               echo
-              echo "## Linked issues (pre-fetched for spec context)"
+              echo "## Linked issues (fetched for spec context)"
               cat "$linked"
             } >> "$RUNNER_TEMP/pr-context.md"
           fi
 
+          reviewed_sha="$(git rev-parse --short=7 'HEAD^2' 2>/dev/null \
+            || jq -r '.headRefOid[0:7]' "$pr_json")"
+
           echo "base_ref=$base_ref"         >> "$GITHUB_OUTPUT"
-          echo "head_sha=$head_sha"         >> "$GITHUB_OUTPUT"
           echo "reviewed_sha=$reviewed_sha" >> "$GITHUB_OUTPUT"
 
-      # ---------------------------------------------------------------
-      # 4. Optional: install project dependencies.
-      # ---------------------------------------------------------------
       - name: Install project dependencies
         id: deps
         if: inputs.pre_install_command != ''
@@ -179,53 +147,38 @@ jobs:
         shell: bash
         run: ${{ inputs.pre_install_command }}
 
-      # ---------------------------------------------------------------
-      # 5. Set up Node.js and install Codex CLI.
-      # ---------------------------------------------------------------
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: "24"
 
       - name: Install Codex CLI
-        shell: bash
         run: npm install -g @openai/codex@${{ inputs.codex_version }}
 
-      # ---------------------------------------------------------------
-      # 6. Enable unprivileged user namespaces for bubblewrap.
-      # ---------------------------------------------------------------
-      - name: Enable unprivileged user namespaces
+      - name: Enable unprivileged user namespaces for bubblewrap
         shell: bash
         run: |
           set -euo pipefail
-          if [[ "$(sysctl -n kernel.unprivileged_userns_clone 2>/dev/null || true)" != "1" ]]; then
+          if [ "$(sysctl -n kernel.unprivileged_userns_clone 2>/dev/null || true)" != "1" ]; then
             sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
           fi
-          if [[ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || true)" != "0" ]]; then
+          if [ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || true)" != "0" ]; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
           fi
 
-      # ---------------------------------------------------------------
-      # 7. Build the prompt and run Codex.
-      #    Codex is instructed to output a JSON review object between
-      #    BEGIN_REVIEW_JSON / END_REVIEW_JSON markers so we can parse
-      #    it reliably without depending on clean JSON-only output.
-      # ---------------------------------------------------------------
       - name: Run Codex PR review
-        id: codex
         shell: bash
         env:
           CODEX_ACCESS_TOKEN: ${{ secrets.CODEX_ACCESS_TOKEN }}
           PR_NUMBER: ${{ steps.pr.outputs.number }}
           BASE_REF: ${{ steps.context.outputs.base_ref }}
-          REVIEWED_SHA: ${{ steps.context.outputs.reviewed_sha }}
           DEPS_OUTCOME: ${{ steps.deps.outcome }}
           PRE_INSTALL_CMD: ${{ inputs.pre_install_command }}
         run: |
           set -euo pipefail
 
-          if [[ -z "${CODEX_ACCESS_TOKEN:-}" ]]; then
-            echo "::error::CODEX_ACCESS_TOKEN secret is not set." >&2
+          if [ -z "${CODEX_ACCESS_TOKEN:-}" ]; then
+            echo "CODEX_ACCESS_TOKEN secret is required." >&2
             exit 1
           fi
 
@@ -239,109 +192,31 @@ jobs:
           export CODEX_HOME="$RUNNER_TEMP/codex-home"
           mkdir -p "$CODEX_HOME"
 
-          prompt_file="$RUNNER_TEMP/prompt.md"
-          review_file="$RUNNER_TEMP/review.md"
+          prompt_file="$RUNNER_TEMP/codex-pr-review-prompt.md"
+          review_file="$RUNNER_TEMP/codex-pr-review.md"
 
           repo_prompt=".github/codex/prompts/codex-pr-review.md"
-          if [[ -f "$repo_prompt" ]]; then
-            cat "$repo_prompt" > "$prompt_file"
-          else
-            cat > "$prompt_file" << 'BUILTIN_PROMPT'
-          You are an AI code reviewer running inside GitHub Actions. Your job is to
-          review this pull request and produce a structured JSON review — identical in
-          spirit to a GitHub Copilot code review.
-
-          ## Review scope
-
-          Review only the changes introduced by this PR:
-
-            git diff HEAD^1...HEAD
-
-          Open actual files at the cited lines before reporting a finding. Never report
-          issues based on the diff alone.
-
-          ## What to check
-
-          For every changed file, evaluate:
-
-          - **Correctness** — logic errors, off-by-one, null dereferences, unhandled edge cases.
-          - **Security** — injection (SQL, shell, XSS), hardcoded secrets, OWASP Top 10.
-          - **Performance** — N+1 queries, missing indexes, large bundle imports, O(n^2) loops.
-          - **Reliability** — missing retries, no timeouts, state not cleaned up on error.
-          - **Test coverage** — changed behaviour covered? Assertions meaningful?
-          - **API contracts** — removed/renamed fields, type changes, new required parameters.
-
-          ## Signal bar
-
-          Only report findings you are confident about. Do not flag style preferences not
-          enforced by the project linter, or issues outside the diff.
-
-          ## CI adapter rules
-
-          - Do not edit, stage, commit, or push any file.
-          - Use the pre-fetched PR context below; do not call gh commands directly.
-          - Run linters or tests only if the dependency installation succeeded (check the
-            runtime context for the outcome).
-          BUILTIN_PROMPT
+          if [ ! -f "$repo_prompt" ]; then
+            echo "::error::No prompt found at $repo_prompt. Create it from examples/prompt-template.md." >&2
+            exit 1
           fi
 
-          # Append the JSON output instructions + runtime context.
           {
+            cat "$repo_prompt"
             echo
-            echo "---"
-            echo "## Output format (REQUIRED)"
-            echo
-            echo "You MUST output your review between these exact markers, as a single valid JSON object."
-            echo "Do not wrap it in markdown code fences. Do not output anything after END_REVIEW_JSON."
-            echo
-            echo "BEGIN_REVIEW_JSON"
-            echo '{'
-            echo '  "verdict": "APPROVE" | "REQUEST_CHANGES" | "COMMENT",'
-            echo '  "summary": "One-paragraph plain-text overview of findings for the review body. Include the reviewed SHA: '"${REVIEWED_SHA}"'.",'
-            echo '  "comments": ['
-            echo '    {'
-            echo '      "path": "relative/path/to/file.ts",'
-            echo '      "line": 42,'
-            echo '      "severity": "blocking" | "suggestion" | "nitpick",'
-            echo '      "body": "Finding description. Be specific — include why this matters and how to fix it."'
-            echo '    }'
-            echo '  ]'
-            echo '}'
-            echo "END_REVIEW_JSON"
-            echo
-            echo "Rules for comments:"
-            echo "- path must be a real file path from the diff (relative to repo root)."
-            echo "- line must be a line number that exists in the diff (added or context line on the right side)."
-            echo "- If you are not certain a line is in the diff, put the finding in summary instead."
-            echo "- Prefix each body with the severity: [Blocking], [Suggestion], or [Nitpick]."
-            echo "- Use an empty comments array ([]) if there are no inline findings."
-            echo
-            echo "---"
-            echo "## Runtime context"
-            echo
+            echo "## Runtime Context"
             cat "$RUNNER_TEMP/pr-context.md"
             echo
-            echo "## Checkout layout"
-            echo "- HEAD = refs/pull/${PR_NUMBER}/merge (GitHub's merge of this PR into ${BASE_REF})"
-            echo "- HEAD^1 = ${BASE_REF} base commit"
-            echo "- HEAD^2 = PR head commit (reviewed SHA: ${REVIEWED_SHA})"
-            echo "- Three-dot diff: git diff HEAD^1...HEAD"
-            echo "- Single-file diff: git diff HEAD^1...HEAD -- <path>"
-            echo
-            if [[ -n "${PRE_INSTALL_CMD:-}" ]]; then
-              echo "## Dependency installation"
-              echo "- Command: ${PRE_INSTALL_CMD}"
-              echo "- Outcome: ${DEPS_OUTCOME:-not run}"
-              if [[ "${DEPS_OUTCOME:-}" == "success" ]]; then
-                echo "- Tools installed by that command are available."
-              else
-                echo "- Installation did not complete successfully."
-              fi
-            else
-              echo "## Dependency installation"
-              echo "- No pre_install_command set. Project tools are not pre-installed."
+            echo "## Checkout and refs"
+            echo "- HEAD is refs/pull/${PR_NUMBER}/merge: GitHub's merge of this PR into ${BASE_REF}."
+            echo "- Its first parent (HEAD^1) is the ${BASE_REF} base; the second parent (HEAD^2) is the PR head."
+            echo "- Review only this PR's changes: git diff HEAD^1...HEAD"
+            echo "- Scope to one file: git diff HEAD^1...HEAD -- <path>"
+            if [ -n "${PRE_INSTALL_CMD:-}" ]; then
+              echo "- Dependency install command: ${PRE_INSTALL_CMD}"
+              echo "- Dependency install outcome: ${DEPS_OUTCOME:-not run}"
             fi
-          } >> "$prompt_file"
+          } > "$prompt_file"
 
           codex exec \
             --ephemeral \
@@ -351,158 +226,71 @@ jobs:
             -o "$review_file" \
             - < "$prompt_file"
 
-          if [[ ! -s "$review_file" ]]; then
-            echo "::error::Codex produced an empty review." >&2
+          if [ ! -s "$review_file" ]; then
+            echo "Codex did not write a review." >&2
             exit 1
           fi
 
-          # Extract JSON from between the markers.
-          json_file="$RUNNER_TEMP/review.json"
-          if grep -q 'BEGIN_REVIEW_JSON' "$review_file"; then
-            sed -n '/BEGIN_REVIEW_JSON/{n;/END_REVIEW_JSON/!{:loop;p;n;/END_REVIEW_JSON/!b loop}}' \
-              "$review_file" > "$json_file"
-          else
-            # Codex did not use markers; try treating the whole output as JSON.
-            # Strip markdown code fences if present.
-            sed 's/^```json//;s/^```//' "$review_file" | grep -v '^[[:space:]]*$' > "$json_file" || true
+          if ! grep -q '<!-- codex-reviewer -->' "$review_file"; then
+            {
+              echo '<!-- codex-reviewer -->'
+              echo
+              cat "$review_file"
+            } > "$review_file.tmp"
+            mv "$review_file.tmp" "$review_file"
           fi
 
-          if ! jq -e . "$json_file" > /dev/null 2>&1; then
-            echo "::warning::Codex output is not valid JSON; falling back to plain comment."
-            # Write a fallback marker so the posting step knows to use createComment.
-            echo "FALLBACK_PLAIN_COMMENT" > "$RUNNER_TEMP/review-mode.txt"
-            cp "$review_file" "$RUNNER_TEMP/review-fallback.md"
-          else
-            echo "JSON" > "$RUNNER_TEMP/review-mode.txt"
-          fi
-
-      # ---------------------------------------------------------------
-      # 8. Post the review.
-      #    - Happy path: parse JSON, validate lines against the diff,
-      #      post via createReview with inline comments (mirrors Copilot).
-      #    - Fallback: if JSON parsing failed, post as a plain PR comment.
-      # ---------------------------------------------------------------
-      - name: Post Codex review
-        id: post_review
+      - name: Post Codex review comment
+        id: post_comment
         uses: actions/github-script@v7
         env:
           PR_NUMBER: ${{ steps.pr.outputs.number }}
-          HEAD_SHA: ${{ steps.context.outputs.head_sha }}
-          RUNNER_TEMP_PATH: ${{ runner.temp }}
+          REVIEW_FILE: ${{ runner.temp }}/codex-pr-review.md
+          REVIEWED_SHA: ${{ steps.context.outputs.reviewed_sha }}
         with:
           github-token: ${{ github.token }}
           script: |
             const fs = require("fs");
-            const path = require("path");
-            const tmp = process.env.RUNNER_TEMP_PATH;
-            const pull_number = Number(process.env.PR_NUMBER);
-            const commit_id = process.env.HEAD_SHA;
+
+            const MAX_COMMENT_LENGTH = 65536;
+            let body = fs.readFileSync(process.env.REVIEW_FILE, "utf8").trim();
+            const issue_number = Number(process.env.PR_NUMBER);
             const { owner, repo } = context.repo;
 
-            const mode = fs.readFileSync(path.join(tmp, "review-mode.txt"), "utf8").trim();
-
-            // ---- Fallback: post plain comment ----
-            if (mode !== "JSON") {
-              const body = fs.readFileSync(path.join(tmp, "review-fallback.md"), "utf8").trim();
-              const created = await github.rest.issues.createComment({
-                owner, repo, issue_number: pull_number, body,
-              });
-              core.setOutput("review_url", created.data.html_url);
-              core.notice(`Codex review (plain comment fallback): ${created.data.html_url}`);
-              return;
+            const sha = (process.env.REVIEWED_SHA || "").trim();
+            if (sha) {
+              body = body.replace(
+                "<!-- codex-reviewer -->",
+                `<!-- codex-reviewer -->\n_Codex review of \`${sha}\`_`,
+              );
             }
 
-            // ---- Parse JSON review ----
-            const review = JSON.parse(fs.readFileSync(path.join(tmp, "review.json"), "utf8"));
-            const rawComments = Array.isArray(review.comments) ? review.comments : [];
-
-            // ---- Fetch PR diff to validate line numbers ----
-            // Only lines present in the diff (added or context on RIGHT side) can
-            // receive inline comments. Invalid lines cause a 422 from the API.
-            const { data: prFiles } = await github.rest.pulls.listFiles({
-              owner, repo, pull_number,
-            });
-
-            const commentableLines = {};
-            for (const file of prFiles) {
-              commentableLines[file.filename] = new Set();
-              if (!file.patch) continue;
-              let lineNum = 0;
-              for (const line of file.patch.split("\n")) {
-                if (line.startsWith("@@")) {
-                  const m = line.match(/@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
-                  if (m) lineNum = parseInt(m[1], 10) - 1;
-                } else if (line.startsWith("-")) {
-                  // Removed line: exists only on LEFT side, skip RIGHT count.
-                } else {
-                  // Added (+) or context ( ) line: commentable on RIGHT side.
-                  lineNum++;
-                  commentableLines[file.filename].add(lineNum);
-                }
-              }
+            if (body.length > MAX_COMMENT_LENGTH) {
+              const notice = "\n\n_Review truncated to fit GitHub's comment size limit._";
+              body = body.slice(0, MAX_COMMENT_LENGTH - notice.length) + notice;
             }
 
-            // ---- Split findings: inline vs. body-only ----
-            const inlineComments = [];
-            const bodyOnlyFindings = [];
-
-            for (const c of rawComments) {
-              if (!c.path || !c.line || !c.body) continue;
-              const eligible = commentableLines[c.path]?.has(c.line);
-              if (eligible) {
-                inlineComments.push({ path: c.path, line: c.line, side: "RIGHT", body: c.body });
-              } else {
-                bodyOnlyFindings.push(`**\`${c.path}:${c.line}\`** — ${c.body}`);
-              }
-            }
-
-            // ---- Build review body ----
-            const MAX_BODY = 65536;
-            let body = (review.summary || "").trim();
-            if (bodyOnlyFindings.length > 0) {
-              body += "\n\n---\n\n**Findings outside the diff:**\n" +
-                bodyOnlyFindings.map((f) => `- ${f}`).join("\n");
-            }
-            if (body.length > MAX_BODY) {
-              body = body.slice(0, MAX_BODY - 50) + "\n\n_[truncated]_";
-            }
-
-            // ---- Map verdict ----
-            const validEvents = new Set(["APPROVE", "REQUEST_CHANGES", "COMMENT"]);
-            const event = validEvents.has(review.verdict) ? review.verdict : "COMMENT";
-
-            // ---- Post PR review ----
-            const { data: posted } = await github.rest.pulls.createReview({
+            const created = await github.rest.issues.createComment({
               owner,
               repo,
-              pull_number,
-              commit_id,
-              event,
+              issue_number,
               body,
-              comments: inlineComments,
             });
+            core.setOutput("comment_url", created.data.html_url);
+            core.notice(`Codex review comment: ${created.data.html_url}`);
 
-            core.setOutput("review_url", posted.html_url);
-            core.notice(`Codex review posted: ${posted.html_url}`);
-
-      # ---------------------------------------------------------------
-      # 9. Job summary.
-      # ---------------------------------------------------------------
-      - name: Write job summary
+      - name: Write run summary
         if: always()
         shell: bash
         env:
-          REVIEW_URL: ${{ steps.post_review.outputs.review_url }}
-          CODEX_OUTCOME: ${{ steps.codex.outcome }}
+          COMMENT_URL: ${{ steps.post_comment.outputs.comment_url }}
         run: |
           {
             echo "## Codex PR Review"
             echo
-            if [[ "$CODEX_OUTCOME" == "success" && -n "${REVIEW_URL:-}" ]]; then
-              echo "Review posted: $REVIEW_URL"
-            elif [[ "$CODEX_OUTCOME" == "failure" ]]; then
-              echo ":x: Codex did not produce a review. Check the step logs above."
+            if [ -n "${COMMENT_URL:-}" ]; then
+              echo "Posted review comment: $COMMENT_URL"
             else
-              echo ":warning: Review step outcome: $CODEX_OUTCOME"
+              echo ":x: Review did not complete. Check the step logs above."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
