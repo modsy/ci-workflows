@@ -1,0 +1,61 @@
+# .github/workflows/pr-review.yml
+#
+# Codex PR review — for repos with internal contributors only (no fork PRs).
+#
+# Uses the `pull_request` trigger, which runs in the context of the base branch
+# and does NOT grant access to secrets for fork PRs. No fork guard is needed.
+#
+# Copy this file to .github/workflows/pr-review.yml in your service repo.
+# Adjust `pre_install_command` for your stack (or remove if not needed).
+
+name: PR Review
+
+on:
+  pull_request:
+    # opened:          new PR — review immediately (unless draft)
+    # synchronize:     new commits pushed — review the updated PR
+    # reopened:        PR reopened after close
+    # ready_for_review: PR moved out of draft — review for the first time
+    types: [opened, synchronize, reopened, ready_for_review]
+
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to review (required for manual runs)"
+        required: true
+        type: number
+
+# Queue reviews for the same PR; never cancel a review that is already running.
+concurrency:
+  group: codex-pr-review-${{ github.event.pull_request.number || inputs.pr_number }}
+  cancel-in-progress: false
+
+jobs:
+  codex-review:
+    # Skip draft PRs on push events. When a draft is marked ready, the
+    # ready_for_review event fires and this condition allows it through.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.pull_request.draft == false
+
+    uses: modsy/ci-workflows/.github/workflows/codex-pr-review.yml@main
+
+    with:
+      pr_number: ${{ inputs.pr_number }}
+
+      # Optional: install project dependencies before Codex runs.
+      # This lets Codex invoke linters, type-checkers, and test runners.
+      # Remove this line if your review prompt does not need them.
+      #
+      # Examples:
+      #   Django + React stack:  "cd backend && pip install -r requirements.txt && cd ../frontend && npm ci"
+      #   Python only:           "pip install -r requirements.txt"
+      #   Node only:             "npm ci"
+      pre_install_command: ""
+
+      # Pin the Codex version for reproducible reviews.
+      # Check https://www.npmjs.com/package/@openai/codex for the latest release.
+      codex_version: "0.142.0"
+
+    secrets:
+      CODEX_ACCESS_TOKEN: ${{ secrets.CODEX_ACCESS_TOKEN }}

@@ -1,81 +1,457 @@
 name: Codex PR Review (Reusable)
+# Called by service repos via workflow_call. Never triggered directly.
+# See examples/ for ready-to-use caller workflows.
 
 on:
   workflow_call:
     inputs:
       pr_number:
-        description: "Pull request number to review"
+        description: >
+          Pull request number to review. Auto-resolved from the triggering
+          event if omitted. Required when called via workflow_dispatch.
         required: false
         type: number
+
       codex_version:
-        description: "Codex CLI version to install (default: latest)"
+        description: >
+          @openai/codex npm package version to install. Pin this in your
+          caller for reproducible reviews. Bump deliberately — do not track
+          latest in a workflow that runs with repo secrets.
         required: false
         type: string
-        default: "latest"
+        default: "0.142.0"
+
+      pre_install_command:
+        description: >
+          Optional shell command executed after checkout and before Codex
+          runs. Use it to install project dependencies so Codex can invoke
+          linters, type-checkers, or test runners during its review.
+          Example: "npm ci" or "pip install -r requirements.txt".
+          The command runs with continue-on-error; a failure is logged but
+          does not abort the review.
+        required: false
+        type: string
+        default: ""
+
     secrets:
       CODEX_ACCESS_TOKEN:
-        description: "Anthropic API key or Claude Code access token for Codex CLI"
+        description: >
+          Anthropic API key or Claude Code access token for the Codex CLI.
+          Store this as an org-level secret scoped to the repos that need it.
+          Never put it in this shared repo.
         required: true
+
+    outputs:
+      comment_url:
+        description: "URL of the posted Codex review comment."
+        value: ${{ jobs.codex-review.outputs.comment_url }}
 
 jobs:
   codex-review:
-    name: Codex AI Review
+    name: Review PR with Codex
     runs-on: ubuntu-latest
+
+    # Concurrency: queue reviews for the same PR; never cancel mid-review.
+    # The group key falls back to the run ID for workflow_dispatch calls so
+    # manual reruns are never queued behind each other.
+    concurrency:
+      group: >-
+        codex-pr-review-${{
+          github.event.pull_request.number
+          || inputs.pr_number
+          || github.run_id
+        }}
+      cancel-in-progress: false
+
     permissions:
-      contents: read
-      pull-requests: write
+      contents: read       # checkout
+      issues: write        # post comment (issues API covers PR comments)
+      pull-requests: write # read PR metadata via gh CLI
+
+    outputs:
+      comment_url: ${{ steps.post_comment.outputs.comment_url }}
 
     steps:
-      - name: Checkout code
+      # ---------------------------------------------------------------
+      # 1. Resolve the PR number from the triggering event or the input.
+      # ---------------------------------------------------------------
+      - name: Resolve PR number
+        id: pr
+        shell: bash
+        env:
+          EVENT_PR_NUMBER: ${{ github.event.pull_request.number }}
+          INPUT_PR_NUMBER: ${{ inputs.pr_number }}
+        run: |
+          set -euo pipefail
+          pr_number="${EVENT_PR_NUMBER:-${INPUT_PR_NUMBER:-}}"
+          if [[ -z "$pr_number" ]]; then
+            echo "::error::Cannot resolve a PR number. Pass pr_number as an input when calling via workflow_dispatch." >&2
+            exit 1
+          fi
+          if ! [[ "$pr_number" =~ ^[0-9]+$ ]]; then
+            echo "::error::PR number '${pr_number}' is not numeric." >&2
+            exit 1
+          fi
+          echo "number=$pr_number" >> "$GITHUB_OUTPUT"
+
+      # ---------------------------------------------------------------
+      # 2. Check out the PR's merge commit (base + head merged by GitHub).
+      #    persist-credentials: false keeps the GITHUB_TOKEN out of the
+      #    git config so Codex cannot use it to push or fetch privately.
+      # ---------------------------------------------------------------
+      - name: Check out PR merge commit
         uses: actions/checkout@v4
         with:
-          # Fetch full history so Codex can diff against the base branch
+          ref: refs/pull/${{ steps.pr.outputs.number }}/merge
           fetch-depth: 0
+          persist-credentials: false
 
+      # ---------------------------------------------------------------
+      # 3. Fetch PR metadata (title, body, author, linked issues) and
+      #    build the runtime context document Codex receives.
+      #    All GitHub context values are passed via env, never interpolated
+      #    directly into shell, to prevent script-injection attacks.
+      # ---------------------------------------------------------------
+      - name: Fetch PR metadata and build context
+        id: context
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: |
+          set -euo pipefail
+
+          pr_json="$RUNNER_TEMP/pr.json"
+          gh pr view "$PR_NUMBER" \
+            --json number,title,body,url,baseRefName,baseRefOid,headRefName,headRefOid,isDraft,author \
+            > "$pr_json"
+
+          base_ref="$(jq -r '.baseRefName' "$pr_json")"
+
+          # Build the context document that is appended to the prompt.
+          {
+            echo "# Pull request context"
+            echo
+            jq -r '"- Number: #\(.number)
+          - URL: \(.url)
+          - Title: \(.title)
+          - Author: \(.author.login)
+          - Base: \(.baseRefName)@\(.baseRefOid)
+          - Head: \(.headRefName)@\(.headRefOid)
+          - Draft: \(.isDraft)"' "$pr_json"
+            echo
+            echo "## Body"
+            jq -r '.body // "(no body)"' "$pr_json"
+          } > "$RUNNER_TEMP/pr-context.md"
+
+          # Fetch linked issues (closing refs + any #N mentions) for spec context.
+          pr_text="$(jq -r '"\(.title)\n\(.body // "")"' "$pr_json")"
+          closing_refs="$(printf '%s' "$pr_text" \
+            | grep -oiE '(^|[^a-zA-Z])(close[sd]?|fix(es|ed)?|resolve[ds]?)[[:space:]:]+#[0-9]+' \
+            | grep -oE '[0-9]+' || true)"
+          all_refs="$(printf '%s' "$pr_text" \
+            | grep -oE '(^|[^A-Za-z0-9_/-])#[0-9]+' \
+            | grep -oE '[0-9]+' || true)"
+          refs="$(printf '%s\n%s\n' "$closing_refs" "$all_refs" \
+            | awk -v self="$PR_NUMBER" 'NF && $0 != self && !seen[$0]++' \
+            | head -n 6)"
+
+          linked="$RUNNER_TEMP/linked-issues.md"
+          : > "$linked"
+          for n in $refs; do
+            if issue_json="$(gh issue view "$n" --json number,title,state,body 2>/dev/null)"; then
+              {
+                echo
+                printf '### Issue #%s\n\n' "$n"
+                printf '%s' "$issue_json" \
+                  | jq -r '"**\(.title)** [\(.state)]\n\n\(.body // "")"'
+              } >> "$linked"
+            fi
+          done
+
+          if [[ -s "$linked" ]]; then
+            head -c 60000 "$linked" > "$linked.cap" && mv "$linked.cap" "$linked"
+            {
+              echo
+              echo "## Linked issues (pre-fetched for spec context)"
+              cat "$linked"
+            } >> "$RUNNER_TEMP/pr-context.md"
+          fi
+
+          # Capture the reviewed SHA *before* Codex runs so a push mid-review
+          # cannot make the posted comment stamp a newer SHA than was reviewed.
+          reviewed_sha="$(git rev-parse --short=7 'HEAD^2' 2>/dev/null \
+            || jq -r '.headRefOid[0:7]' "$pr_json")"
+
+          echo "base_ref=$base_ref"         >> "$GITHUB_OUTPUT"
+          echo "reviewed_sha=$reviewed_sha" >> "$GITHUB_OUTPUT"
+
+      # ---------------------------------------------------------------
+      # 4. Optional: install project dependencies before Codex runs.
+      #    Callers pass pre_install_command for their stack
+      #    (e.g. "npm ci" or "pip install -r requirements.txt").
+      #    We continue-on-error and report the outcome in the prompt so
+      #    Codex knows whether tools like pytest or tsc are available.
+      # ---------------------------------------------------------------
+      - name: Install project dependencies
+        id: deps
+        if: inputs.pre_install_command != ''
+        continue-on-error: true
+        shell: bash
+        run: ${{ inputs.pre_install_command }}
+
+      # ---------------------------------------------------------------
+      # 5. Set up Node.js and install the Codex CLI at the pinned version.
+      # ---------------------------------------------------------------
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: "20"
 
       - name: Install Codex CLI
+        run: npm install -g @openai/codex@${{ inputs.codex_version }}
+
+      # ---------------------------------------------------------------
+      # 6. Bubblewrap requires unprivileged user namespaces on Linux.
+      #    These sysctls are not set by default on all GitHub-hosted runners.
+      # ---------------------------------------------------------------
+      - name: Enable unprivileged user namespaces for bubblewrap
+        shell: bash
         run: |
-          if [ "${{ inputs.codex_version }}" = "latest" ]; then
-            npm install -g @anthropic-ai/codex
-          else
-            npm install -g @anthropic-ai/codex@${{ inputs.codex_version }}
+          set -euo pipefail
+          if [[ "$(sysctl -n kernel.unprivileged_userns_clone 2>/dev/null || true)" != "1" ]]; then
+            sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
+          fi
+          if [[ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || true)" != "0" ]]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
           fi
 
-      - name: Determine PR number
-        id: pr
-        run: |
-          PR="${{ inputs.pr_number || github.event.pull_request.number }}"
-          echo "number=$PR" >> "$GITHUB_OUTPUT"
-
+      # ---------------------------------------------------------------
+      # 7. Build the full prompt and run Codex.
+      #    The prompt = caller's prompt file (or a built-in default)
+      #                 + runtime context (PR metadata, refs, dep status).
+      #    CODEX_ACCESS_TOKEN is passed via env only; never interpolated
+      #    into shell to prevent it appearing in logs.
+      # ---------------------------------------------------------------
       - name: Run Codex PR review
+        id: codex
+        shell: bash
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.CODEX_ACCESS_TOKEN }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CODEX_ACCESS_TOKEN: ${{ secrets.CODEX_ACCESS_TOKEN }}
           PR_NUMBER: ${{ steps.pr.outputs.number }}
-          REPO: ${{ github.repository }}
+          BASE_REF: ${{ steps.context.outputs.base_ref }}
+          DEPS_OUTCOME: ${{ steps.deps.outcome }}
+          PRE_INSTALL_CMD: ${{ inputs.pre_install_command }}
         run: |
-          # Resolve the prompt file — callers can ship their own at this path
-          PROMPT_FILE=".github/codex/prompts/codex-pr-review.md"
+          set -euo pipefail
 
-          if [ ! -f "$PROMPT_FILE" ]; then
-            echo "No prompt file found at $PROMPT_FILE — using built-in default"
-            PROMPT_FILE=""
+          if [[ -z "${CODEX_ACCESS_TOKEN:-}" ]]; then
+            echo "::error::CODEX_ACCESS_TOKEN secret is not set. Add it as an org or repo secret named CODEX_ACCESS_TOKEN." >&2
+            exit 1
           fi
 
-          # Build the review instruction
-          if [ -n "$PROMPT_FILE" ]; then
-            INSTRUCTION=$(cat "$PROMPT_FILE")
+          export CODEX_HOME="$RUNNER_TEMP/codex-home"
+          mkdir -p "$CODEX_HOME"
+
+          prompt_file="$RUNNER_TEMP/prompt.md"
+          review_file="$RUNNER_TEMP/review.md"
+
+          # Use the caller repo's prompt if it exists; otherwise fall back to
+          # the built-in default. The prompt file is the right place for all
+          # repo-specific review instructions (stack, standards, lenses).
+          repo_prompt=".github/codex/prompts/codex-pr-review.md"
+          if [[ -f "$repo_prompt" ]]; then
+            cat "$repo_prompt" > "$prompt_file"
           else
-            INSTRUCTION="Review this pull request. Check for bugs, security issues, performance problems, and code quality concerns. Post a concise markdown summary as a PR comment. Start the comment with <!-- codex-reviewer --> on its own line so it can be identified later."
+            cat > "$prompt_file" << 'BUILTIN_PROMPT'
+          You are the Codex Reviewer for this repository, running inside GitHub Actions.
+
+          Your job is to review this pull request and produce a single, well-structured
+          Markdown comment that will be posted on the PR.
+
+          ## Review scope
+
+          Review only the changes introduced by this PR using the three-dot diff:
+
+            git diff HEAD^1...HEAD
+
+          Open actual files at the cited lines before reporting a finding — never
+          report issues based on the diff alone.
+
+          ## What to check
+
+          For every changed file, evaluate:
+
+          - **Correctness** — logic errors, off-by-one errors, null dereferences,
+            unhandled edge cases, broken error paths.
+          - **Security** — injection (SQL, shell, XSS), hardcoded secrets, OWASP Top 10,
+            insecure defaults, overly permissive access controls.
+          - **Performance** — N+1 queries, missing indexes, O(n²) loops over large
+            datasets, synchronous I/O on hot paths, large bundle imports.
+          - **Reliability** — missing retries, no timeout on external calls, state
+            not cleaned up on error.
+          - **Test coverage** — is the changed behaviour covered? Are assertions
+            meaningful or just status-code checks?
+          - **API contracts** — removed or renamed fields, changed types, new required
+            parameters that break existing callers.
+
+          ## CI adapter rules
+
+          - Do not edit, stage, commit, or push any file.
+          - Do not call `gh` commands directly. The workflow fetches PR metadata and
+            posts your comment; use the pre-fetched context in this prompt.
+          - Produce **exactly one** Markdown comment body as your final answer.
+          - Start the comment with `<!-- codex-reviewer -->` on its own line.
+
+          ## Comment structure
+
+          ```
+          <!-- codex-reviewer -->
+          _Codex review of `<sha>`_
+
+          ### Verdict
+          <one sentence: Approve / Request changes / Needs discussion>
+
+          ### Findings
+
+          **Blocking**
+          - ...
+
+          **Suggestions**
+          - ...
+
+          **Nitpicks**
+          - ...
+
+          ### Coverage
+          Lenses applied: correctness, security, performance, reliability, tests, contracts
+          Validation run: <list any linters/tests/type-checks you ran, or "none — no pre_install_command set">
+          ```
+
+          Report only concrete, high-signal findings. Omit findings you are not
+          confident about. If there are no issues, say so clearly and approve.
+          BUILTIN_PROMPT
           fi
 
-          # Run Codex in ephemeral, sandboxed mode — no persistent state, workspace-write only
+          # Append runtime context so Codex knows the PR details and ref layout.
+          {
+            echo
+            echo "---"
+            echo "## Runtime context (injected by workflow — do not reproduce in output)"
+            echo
+            cat "$RUNNER_TEMP/pr-context.md"
+            echo
+            echo "## Checkout layout"
+            echo "- HEAD = refs/pull/${PR_NUMBER}/merge (GitHub's test merge of this PR into ${BASE_REF})"
+            echo "- HEAD^1 = ${BASE_REF} base commit"
+            echo "- HEAD^2 = PR head commit (what to review)"
+            echo "- Three-dot diff: git diff HEAD^1...HEAD"
+            echo "- Single-file diff: git diff HEAD^1...HEAD -- <path>"
+            echo
+            if [[ -n "${PRE_INSTALL_CMD:-}" ]]; then
+              echo "## Dependency installation"
+              echo "- Command: ${PRE_INSTALL_CMD}"
+              echo "- Outcome: ${DEPS_OUTCOME:-not run}"
+              if [[ "${DEPS_OUTCOME:-}" == "success" ]]; then
+                echo "- Tools installed by that command are available in this environment."
+              else
+                echo "- Installation did not complete successfully; tool availability may be limited."
+              fi
+            else
+              echo "## Dependency installation"
+              echo "- No pre_install_command was set. Project tools (linters, type-checkers, test runners) are not pre-installed."
+              echo "- You may install them yourself if needed for validation."
+            fi
+          } >> "$prompt_file"
+
           codex exec \
             --ephemeral \
             --sandbox workspace-write \
-            --quiet \
-            "$INSTRUCTION"
+            -c sandbox_workspace_write.network_access=true \
+            -C "$GITHUB_WORKSPACE" \
+            -o "$review_file" \
+            - < "$prompt_file"
+
+          if [[ ! -s "$review_file" ]]; then
+            echo "::error::Codex produced an empty review." >&2
+            exit 1
+          fi
+
+          # Guarantee the marker is present even if the model omitted it.
+          if ! grep -q '<!-- codex-reviewer -->' "$review_file"; then
+            { printf '<!-- codex-reviewer -->\n\n'; cat "$review_file"; } \
+              > "$review_file.tmp"
+            mv "$review_file.tmp" "$review_file"
+          fi
+
+      # ---------------------------------------------------------------
+      # 8. Post the review as a new PR comment.
+      #    Always post a new comment — never edit a prior one — so the
+      #    full history of reviews is visible as a chronological trail.
+      #    The <!-- codex-reviewer --> marker identifies Codex comments.
+      # ---------------------------------------------------------------
+      - name: Post Codex review comment
+        id: post_comment
+        uses: actions/github-script@v7
+        env:
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          REVIEW_FILE: ${{ runner.temp }}/review.md
+          REVIEWED_SHA: ${{ steps.context.outputs.reviewed_sha }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const fs = require("fs");
+
+            const MAX_COMMENT_LENGTH = 65536; // GitHub hard limit on issue comments
+            let body = fs.readFileSync(process.env.REVIEW_FILE, "utf8").trim();
+            const issue_number = Number(process.env.PR_NUMBER);
+            const { owner, repo } = context.repo;
+
+            // Stamp the SHA that was reviewed. Captured before Codex ran so a
+            // push mid-review cannot mislabel the comment.
+            const sha = (process.env.REVIEWED_SHA || "").trim();
+            if (sha) {
+              body = body.replace(
+                "<!-- codex-reviewer -->",
+                `<!-- codex-reviewer -->\n_Codex review of \`${sha}\`_`,
+              );
+            }
+
+            // Truncate gracefully rather than hard-failing if the review is huge.
+            if (body.length > MAX_COMMENT_LENGTH) {
+              const notice = "\n\n_Review truncated to fit GitHub's comment size limit._";
+              body = body.slice(0, MAX_COMMENT_LENGTH - notice.length) + notice;
+            }
+
+            const created = await github.rest.issues.createComment({
+              owner,
+              repo,
+              issue_number,
+              body,
+            });
+
+            core.setOutput("comment_url", created.data.html_url);
+            core.notice(`Codex review posted: ${created.data.html_url}`);
+
+      # ---------------------------------------------------------------
+      # 9. Write a job summary so the review is visible in the Actions UI
+      #    without having to navigate to the PR.
+      # ---------------------------------------------------------------
+      - name: Write job summary
+        if: always()
+        shell: bash
+        env:
+          COMMENT_URL: ${{ steps.post_comment.outputs.comment_url }}
+          CODEX_OUTCOME: ${{ steps.codex.outcome }}
+        run: |
+          {
+            echo "## Codex PR Review"
+            echo
+            if [[ "$CODEX_OUTCOME" == "success" && -n "${COMMENT_URL:-}" ]]; then
+              echo "Review posted: $COMMENT_URL"
+            elif [[ "$CODEX_OUTCOME" == "failure" ]]; then
+              echo ":x: Codex did not produce a review. Check the step logs above."
+            else
+              echo ":warning: Review step outcome: $CODEX_OUTCOME"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
