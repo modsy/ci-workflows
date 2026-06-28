@@ -1,0 +1,81 @@
+name: Codex PR Review (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        description: "Pull request number to review"
+        required: false
+        type: number
+      codex_version:
+        description: "Codex CLI version to install (default: latest)"
+        required: false
+        type: string
+        default: "latest"
+    secrets:
+      CODEX_ACCESS_TOKEN:
+        description: "Anthropic API key or Claude Code access token for Codex CLI"
+        required: true
+
+jobs:
+  codex-review:
+    name: Codex AI Review
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          # Fetch full history so Codex can diff against the base branch
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Codex CLI
+        run: |
+          if [ "${{ inputs.codex_version }}" = "latest" ]; then
+            npm install -g @anthropic-ai/codex
+          else
+            npm install -g @anthropic-ai/codex@${{ inputs.codex_version }}
+          fi
+
+      - name: Determine PR number
+        id: pr
+        run: |
+          PR="${{ inputs.pr_number || github.event.pull_request.number }}"
+          echo "number=$PR" >> "$GITHUB_OUTPUT"
+
+      - name: Run Codex PR review
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.CODEX_ACCESS_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          # Resolve the prompt file — callers can ship their own at this path
+          PROMPT_FILE=".github/codex/prompts/codex-pr-review.md"
+
+          if [ ! -f "$PROMPT_FILE" ]; then
+            echo "No prompt file found at $PROMPT_FILE — using built-in default"
+            PROMPT_FILE=""
+          fi
+
+          # Build the review instruction
+          if [ -n "$PROMPT_FILE" ]; then
+            INSTRUCTION=$(cat "$PROMPT_FILE")
+          else
+            INSTRUCTION="Review this pull request. Check for bugs, security issues, performance problems, and code quality concerns. Post a concise markdown summary as a PR comment. Start the comment with <!-- codex-reviewer --> on its own line so it can be identified later."
+          fi
+
+          # Run Codex in ephemeral, sandboxed mode — no persistent state, workspace-write only
+          codex exec \
+            --ephemeral \
+            --sandbox workspace-write \
+            --quiet \
+            "$INSTRUCTION"
