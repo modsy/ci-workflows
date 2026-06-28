@@ -217,9 +217,12 @@ jobs:
           fi
 
           case "$CODEX_ACCESS_TOKEN" in
-            at-*)  echo "CODEX_ACCESS_TOKEN class: personal access token (at-)" ;;
-            *.*.*) echo "CODEX_ACCESS_TOKEN class: agent-identity JWT" ;;
-            *)     echo "CODEX_ACCESS_TOKEN class: other/opaque" ;;
+            at-*)    echo "CODEX_ACCESS_TOKEN class: personal access token (at-)" ;;
+            sk-*)    echo "CODEX_ACCESS_TOKEN class: OpenAI API key (sk-)"
+                     export OPENAI_API_KEY="$CODEX_ACCESS_TOKEN"
+                     unset CODEX_ACCESS_TOKEN ;;
+            *.*.*)   echo "CODEX_ACCESS_TOKEN class: agent-identity JWT" ;;
+            *)       echo "CODEX_ACCESS_TOKEN class: other/opaque" ;;
           esac
           echo "CODEX_ACCESS_TOKEN length: ${#CODEX_ACCESS_TOKEN}"
 
