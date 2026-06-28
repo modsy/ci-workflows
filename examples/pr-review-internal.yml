@@ -1,18 +1,18 @@
 # .github/workflows/pr-review.yml
 #
-# Codex PR review — for repos with internal contributors only (no fork PRs).
+# Claude AI PR review — for repos with internal contributors only (no fork PRs).
 #
 # Triggers mirror GitHub Copilot code review:
 #   opened:            review when a non-draft PR is first opened.
-#   synchronize:       re-review when new commits are pushed.
+#   synchronize:       re-review on every new push.
 #   reopened:          review when a closed PR is reopened.
 #   ready_for_review:  review when a draft PR is marked ready.
 #
-# Remove "synchronize" if you want one review per PR lifecycle event rather
-# than one per push (lower cost, fewer notifications).
+# Remove "synchronize" if you want one review per lifecycle event rather than
+# one per push (lower cost, fewer notifications).
 #
 # Copy this file to .github/workflows/pr-review.yml in your service repo.
-# Adjust pre_install_command for your stack (or remove if not needed).
+# Adjust pre_install_command for your stack, or remove it if not needed.
 
 name: PR Review
 
@@ -27,29 +27,36 @@ on:
         required: true
         type: number
 
+permissions:
+  contents: read
+  pull-requests: write
+
+# One review at a time per PR; never cancel an in-flight review.
 concurrency:
-  group: codex-pr-review-${{ github.event.pull_request.number || inputs.pr_number }}
+  group: claude-pr-review-${{ github.event.pull_request.number || inputs.pr_number }}
   cancel-in-progress: false
 
 jobs:
-  codex-review:
+  claude-review:
+    # Skip draft PRs on automatic triggers; allow manual runs always.
     if: >-
       github.event_name == 'workflow_dispatch' ||
       github.event.pull_request.draft == false
 
-    uses: modsy/ci-workflows/.github/workflows/codex-pr-review.yml@main
+    uses: modsy/ci-workflows/.github/workflows/claude-pr-review.yml@main
 
     with:
-      pr_number: ${{ inputs.pr_number }}
+      pr_number: ${{ github.event.pull_request.number || inputs.pr_number }}
 
-      # Optional: install project dependencies before Codex runs.
+      # Optional: install project dependencies before the review.
       # Examples:
-      #   Node only:             "npm ci"
-      #   Python only:           "pip install -r requirements.txt"
-      #   Django + React stack:  "pip install -r requirements.txt && npm ci"
-      pre_install_command: ""
+      #   Node:          "npm ci"
+      #   Python:        "pip install -r requirements.txt"
+      #   Django + Node: "pip install -r requirements.txt && npm ci"
+      # pre_install_command: "npm ci"
 
-      codex_version: "0.142.0"
+      # Optional: pin the model for reproducible reviews.
+      # model: "claude-sonnet-4-6"
 
     secrets:
-      CODEX_ACCESS_TOKEN: ${{ secrets.CODEX_ACCESS_TOKEN }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}

@@ -1,0 +1,536 @@
+name: Claude PR Review (Reusable)
+# Called by service repos via workflow_call. Never triggered directly.
+# See examples/ for ready-to-use caller workflows.
+
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        description: >
+          Pull request number to review. Auto-resolved from the triggering
+          event when called via pull_request. Required for workflow_dispatch.
+        required: false
+        type: number
+
+      model:
+        description: >
+          Anthropic model ID to use for the review. Pin this in your caller
+          for reproducible reviews. Bump deliberately.
+        required: false
+        type: string
+        default: "claude-sonnet-4-6"
+
+      max_tokens:
+        description: "Maximum tokens in the model response."
+        required: false
+        type: number
+        default: 4096
+
+      pre_install_command:
+        description: >
+          Optional shell command executed after checkout and before the review
+          runs. Use to install project dependencies so the prompt can reference
+          the outcome (type-checker availability, etc.). Runs with
+          continue-on-error; a failure is logged but does not abort the review.
+        required: false
+        type: string
+        default: ""
+
+    secrets:
+      ANTHROPIC_API_KEY:
+        description: >
+          Anthropic API key. Store as an org-level secret scoped to repos that
+          need it, or as a repo-level secret. Must have access to the model
+          specified in the model input.
+        required: true
+
+    outputs:
+      review_url:
+        description: "URL of the posted PR review."
+        value: ${{ jobs.claude-review.outputs.review_url }}
+
+jobs:
+  claude-review:
+    name: Review PR with Claude
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      pull-requests: write
+
+    outputs:
+      review_url: ${{ steps.post_review.outputs.review_url }}
+
+    steps:
+      # ---------------------------------------------------------------
+      # 1. Resolve the PR number.
+      # ---------------------------------------------------------------
+      - name: Resolve PR number
+        id: pr
+        shell: bash
+        env:
+          EVENT_PR_NUMBER: ${{ github.event.pull_request.number }}
+          INPUT_PR_NUMBER: ${{ inputs.pr_number }}
+        run: |
+          set -euo pipefail
+          pr_number="${EVENT_PR_NUMBER:-${INPUT_PR_NUMBER:-}}"
+          if [[ -z "$pr_number" ]]; then
+            echo "::error::Cannot resolve a PR number. Pass pr_number as an input when calling via workflow_dispatch." >&2
+            exit 1
+          fi
+          if ! [[ "$pr_number" =~ ^[0-9]+$ ]]; then
+            echo "::error::PR number '${pr_number}' is not numeric." >&2
+            exit 1
+          fi
+          echo "number=$pr_number" >> "$GITHUB_OUTPUT"
+
+      # ---------------------------------------------------------------
+      # 2. Check out the PR merge commit.
+      #    persist-credentials: false prevents the token from leaking
+      #    into the git config where scripts could read it.
+      # ---------------------------------------------------------------
+      - name: Check out PR merge commit
+        uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ steps.pr.outputs.number }}/merge
+          fetch-depth: 0
+          persist-credentials: false
+
+      # ---------------------------------------------------------------
+      # 3. Fetch PR metadata, diff, linked issues, and stamp the head SHA
+      #    before the review runs so a push mid-review cannot mislabel it.
+      # ---------------------------------------------------------------
+      - name: Fetch PR metadata and diff
+        id: context
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: |
+          set -euo pipefail
+
+          pr_json="$RUNNER_TEMP/pr.json"
+          gh pr view "$PR_NUMBER" \
+            --json number,title,body,url,baseRefName,baseRefOid,headRefName,headRefOid,isDraft,author \
+            > "$pr_json"
+
+          base_ref="$(jq -r '.baseRefName' "$pr_json")"
+
+          # Prefer the merge-commit second parent for the true PR head SHA.
+          head_sha="$(git rev-parse 'HEAD^2' 2>/dev/null \
+            || jq -r '.headRefOid' "$pr_json")"
+          reviewed_sha="${head_sha:0:7}"
+
+          # Fetch the diff (cap at 100 KB to stay within token limits).
+          diff_file="$RUNNER_TEMP/pr.diff"
+          git diff HEAD^1...HEAD > "$diff_file" || true
+          diff_size="$(wc -c < "$diff_file")"
+          echo "Diff size: ${diff_size} bytes"
+          if (( diff_size > 100000 )); then
+            head -c 100000 "$diff_file" > "$diff_file.cap"
+            echo ">> [diff truncated at 100 KB]" >> "$diff_file.cap"
+            mv "$diff_file.cap" "$diff_file"
+          fi
+
+          # Build PR context block.
+          {
+            echo "# Pull request context"
+            echo
+            jq -r '"- Number: #\(.number)
+          - URL: \(.url)
+          - Title: \(.title)
+          - Author: \(.author.login)
+          - Base: \(.baseRefName)@\(.baseRefOid)
+          - Head: \(.headRefName)@\(.headRefOid)
+          - Draft: \(.isDraft)"' "$pr_json"
+            echo
+            echo "## Description"
+            jq -r '.body // "(no description)"' "$pr_json"
+          } > "$RUNNER_TEMP/pr-context.md"
+
+          # Fetch linked issues (up to 6).
+          pr_text="$(jq -r '"\(.title)\n\(.body // "")"' "$pr_json")"
+          closing_refs="$(printf '%s' "$pr_text" \
+            | grep -oiE '(^|[^a-zA-Z])(close[sd]?|fix(es|ed)?|resolve[ds]?)[[:space:]:]+#[0-9]+' \
+            | grep -oE '[0-9]+' || true)"
+          all_refs="$(printf '%s' "$pr_text" \
+            | grep -oE '(^|[^A-Za-z0-9_/-])#[0-9]+' \
+            | grep -oE '[0-9]+' || true)"
+          refs="$(printf '%s\n%s\n' "$closing_refs" "$all_refs" \
+            | awk -v self="$PR_NUMBER" 'NF && $0 != self && !seen[$0]++' \
+            | head -n 6)"
+
+          linked="$RUNNER_TEMP/linked-issues.md"
+          : > "$linked"
+          for n in $refs; do
+            if issue_json="$(gh issue view "$n" \
+              --json number,title,state,body 2>/dev/null)"; then
+              {
+                echo
+                printf '### Issue #%s\n\n' "$n"
+                printf '%s' "$issue_json" \
+                  | jq -r '"**\(.title)** [\(.state)]\n\n\(.body // "")"'
+              } >> "$linked"
+            fi
+          done
+
+          if [[ -s "$linked" ]]; then
+            head -c 60000 "$linked" > "$linked.cap" && mv "$linked.cap" "$linked"
+            {
+              echo
+              echo "## Linked issues"
+              cat "$linked"
+            } >> "$RUNNER_TEMP/pr-context.md"
+          fi
+
+          echo "base_ref=$base_ref"         >> "$GITHUB_OUTPUT"
+          echo "head_sha=$head_sha"         >> "$GITHUB_OUTPUT"
+          echo "reviewed_sha=$reviewed_sha" >> "$GITHUB_OUTPUT"
+
+      # ---------------------------------------------------------------
+      # 4. Optional: install project dependencies.
+      # ---------------------------------------------------------------
+      - name: Install project dependencies
+        id: deps
+        if: inputs.pre_install_command != ''
+        continue-on-error: true
+        shell: bash
+        run: ${{ inputs.pre_install_command }}
+
+      # ---------------------------------------------------------------
+      # 5. Build the prompt and call the Anthropic Messages API.
+      #    The model is instructed to output a JSON review object between
+      #    BEGIN_REVIEW_JSON / END_REVIEW_JSON markers for reliable parsing.
+      # ---------------------------------------------------------------
+      - name: Run Claude PR review
+        id: claude
+        shell: bash
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          BASE_REF: ${{ steps.context.outputs.base_ref }}
+          REVIEWED_SHA: ${{ steps.context.outputs.reviewed_sha }}
+          HEAD_SHA: ${{ steps.context.outputs.head_sha }}
+          DEPS_OUTCOME: ${{ steps.deps.outcome }}
+          PRE_INSTALL_CMD: ${{ inputs.pre_install_command }}
+          MODEL: ${{ inputs.model }}
+          MAX_TOKENS: ${{ inputs.max_tokens }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
+            echo "::error::ANTHROPIC_API_KEY secret is not set." >&2
+            exit 1
+          fi
+
+          # ----- Build the prompt -----
+          prompt_file="$RUNNER_TEMP/prompt.txt"
+          repo_prompt=".github/claude/prompts/pr-review.md"
+
+          if [[ -f "$repo_prompt" ]]; then
+            cat "$repo_prompt" > "$prompt_file"
+          else
+            cat > "$prompt_file" << 'BUILTIN_PROMPT'
+          You are an AI code reviewer running inside GitHub Actions. Your job is to
+          review this pull request and produce a structured JSON review, identical in
+          behavior to a GitHub Copilot code review.
+
+          ## Review scope
+
+          Review only the changes introduced by this PR (the diff is provided below).
+          Open actual files at the cited lines before reporting a finding. Never report
+          issues based on the diff alone.
+
+          ## What to check
+
+          For every changed file, evaluate:
+
+          - **Correctness** — logic errors, off-by-one, null dereferences, unhandled edge cases.
+          - **Security** — injection (SQL, shell, XSS), hardcoded secrets, OWASP Top 10.
+          - **Performance** — N+1 queries, missing indexes, large bundle imports, O(n²) loops.
+          - **Reliability** — missing retries, no timeouts, state not cleaned up on error.
+          - **Test coverage** — changed behaviour covered? Assertions meaningful?
+          - **API contracts** — removed/renamed fields, type changes, new required parameters.
+
+          ## Signal bar
+
+          Only report findings you are confident about after reading the actual file content.
+          Do not flag:
+          - Style preferences not enforced by the project linter
+          - Hypothetical future problems with no current manifestation
+          - Issues outside the diff that pre-exist this PR
+
+          If there are no issues, approve and say so clearly.
+
+          ## Output format (REQUIRED)
+
+          You MUST output your review between the exact markers below, as a single valid
+          JSON object. Do not wrap in markdown code fences. Do not output anything after
+          END_REVIEW_JSON.
+          BUILTIN_PROMPT
+          fi
+
+          # Append the mandatory output format, runtime context, and diff.
+          {
+            echo
+            echo "---"
+            echo "## Output format (REQUIRED)"
+            echo
+            echo "Output your review between these exact markers as a single valid JSON object."
+            echo "Do not wrap in markdown code fences. Do not output anything after END_REVIEW_JSON."
+            echo
+            cat << 'FORMAT'
+          BEGIN_REVIEW_JSON
+          {
+            "verdict": "APPROVE" | "REQUEST_CHANGES" | "COMMENT",
+            "summary": "One-paragraph plain-text overview. Include: verdict rationale, coverage lenses applied, and the reviewed SHA.",
+            "comments": [
+              {
+                "path": "relative/path/to/file.ts",
+                "line": 42,
+                "severity": "blocking" | "suggestion" | "nitpick",
+                "body": "[Blocking|Suggestion|Nitpick] Description of issue and how to fix it."
+              }
+            ]
+          }
+          END_REVIEW_JSON
+          FORMAT
+            echo
+            echo "Rules for comments:"
+            echo "- path must be a real file path from the diff (relative to repo root)."
+            echo "- line must be a line number present in the diff (added or context line on the RIGHT side)."
+            echo "- If you are not certain a line is in the diff, put the finding in summary instead."
+            echo "- Use an empty array ([]) if there are no inline findings."
+            echo
+            echo "---"
+            echo "## Runtime context"
+            echo
+            echo "- Reviewed SHA: ${REVIEWED_SHA}"
+            echo "- Base branch: ${BASE_REF}"
+            echo "- PR number: ${PR_NUMBER}"
+            echo
+            cat "$RUNNER_TEMP/pr-context.md"
+            echo
+            if [[ -n "${PRE_INSTALL_CMD:-}" ]]; then
+              echo "## Dependency installation"
+              echo "- Command: ${PRE_INSTALL_CMD}"
+              echo "- Outcome: ${DEPS_OUTCOME:-not run}"
+            fi
+            echo
+            echo "---"
+            echo "## Diff"
+            echo
+            echo '```diff'
+            cat "$RUNNER_TEMP/pr.diff"
+            echo '```'
+          } >> "$prompt_file"
+
+          # ----- Call the Anthropic Messages API -----
+          user_message="$(cat "$prompt_file")"
+
+          # jq encodes the message safely as a JSON string.
+          request_body="$(jq -n \
+            --arg model "$MODEL" \
+            --argjson max_tokens "$MAX_TOKENS" \
+            --arg content "$user_message" \
+            '{
+              model: $model,
+              max_tokens: $max_tokens,
+              messages: [{ role: "user", content: $content }]
+            }')"
+
+          response_file="$RUNNER_TEMP/claude-response.json"
+          http_code="$(curl --silent --show-error --fail-with-body \
+            --write-out "%{http_code}" \
+            --output "$response_file" \
+            --request POST \
+            --url "https://api.anthropic.com/v1/messages" \
+            --header "x-api-key: ${ANTHROPIC_API_KEY}" \
+            --header "anthropic-version: 2023-06-01" \
+            --header "content-type: application/json" \
+            --data-raw "$request_body" \
+            || true)"
+
+          if [[ "$http_code" != "200" ]]; then
+            echo "::error::Anthropic API returned HTTP ${http_code}." >&2
+            echo "Response body:" >&2
+            cat "$response_file" >&2
+            exit 1
+          fi
+
+          # Extract the text content from the response.
+          review_text="$(jq -r '.content[0].text' "$response_file")"
+          if [[ -z "$review_text" || "$review_text" == "null" ]]; then
+            echo "::error::Claude returned an empty response." >&2
+            exit 1
+          fi
+
+          review_file="$RUNNER_TEMP/review.txt"
+          printf '%s' "$review_text" > "$review_file"
+
+          # Extract JSON from between the markers.
+          json_file="$RUNNER_TEMP/review.json"
+          if grep -q 'BEGIN_REVIEW_JSON' "$review_file"; then
+            sed -n '/BEGIN_REVIEW_JSON/{n;/END_REVIEW_JSON/!{:loop;p;n;/END_REVIEW_JSON/!b loop}}' \
+              "$review_file" > "$json_file"
+          else
+            # No markers: try treating the whole output as JSON.
+            sed 's/^```json//;s/^```//' "$review_file" \
+              | grep -v '^[[:space:]]*$' > "$json_file" || true
+          fi
+
+          if ! jq -e . "$json_file" > /dev/null 2>&1; then
+            echo "::warning::Claude output is not valid JSON; falling back to plain comment."
+            echo "FALLBACK" > "$RUNNER_TEMP/review-mode.txt"
+            cp "$review_file" "$RUNNER_TEMP/review-fallback.md"
+          else
+            echo "JSON" > "$RUNNER_TEMP/review-mode.txt"
+          fi
+
+      # ---------------------------------------------------------------
+      # 6. Post the review.
+      #    Happy path: JSON review with inline comments via createReview
+      #      (identical behavior to GitHub Copilot).
+      #    Fallback: plain PR comment if JSON parsing failed.
+      # ---------------------------------------------------------------
+      - name: Post Claude review
+        id: post_review
+        if: always() && steps.claude.outcome != 'skipped'
+        uses: actions/github-script@v7
+        env:
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          HEAD_SHA: ${{ steps.context.outputs.head_sha }}
+          RUNNER_TEMP_PATH: ${{ runner.temp }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const fs   = require("fs");
+            const path = require("path");
+
+            const tmp        = process.env.RUNNER_TEMP_PATH;
+            const pull_number = Number(process.env.PR_NUMBER);
+            const commit_id  = process.env.HEAD_SHA;
+            const { owner, repo } = context.repo;
+
+            const claudeOutcome = "${{ steps.claude.outcome }}";
+            if (claudeOutcome === "failure") {
+              // The run step already surfaced an error annotation; nothing more to post.
+              return;
+            }
+
+            const mode = fs.readFileSync(path.join(tmp, "review-mode.txt"), "utf8").trim();
+
+            // ── Fallback: plain comment ──────────────────────────────────────
+            if (mode !== "JSON") {
+              const body = fs.readFileSync(
+                path.join(tmp, "review-fallback.md"), "utf8"
+              ).trim();
+              const created = await github.rest.issues.createComment({
+                owner, repo, issue_number: pull_number, body,
+              });
+              core.setOutput("review_url", created.data.html_url);
+              core.notice(`Claude review (plain comment fallback): ${created.data.html_url}`);
+              return;
+            }
+
+            // ── Parse JSON review ────────────────────────────────────────────
+            const review     = JSON.parse(
+              fs.readFileSync(path.join(tmp, "review.json"), "utf8")
+            );
+            const rawComments = Array.isArray(review.comments)
+              ? review.comments : [];
+
+            // ── Fetch diff to validate commentable line numbers ──────────────
+            // The GitHub API only accepts inline comments on lines that appear
+            // in the diff (added or context on the RIGHT side). Invalid lines
+            // cause a 422; we demote those findings to the review body.
+            const { data: prFiles } = await github.rest.pulls.listFiles({
+              owner, repo, pull_number,
+            });
+
+            const commentableLines = {};
+            for (const file of prFiles) {
+              commentableLines[file.filename] = new Set();
+              if (!file.patch) continue;
+              let lineNum = 0;
+              for (const line of file.patch.split("\n")) {
+                if (line.startsWith("@@")) {
+                  const m = line.match(/@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+                  if (m) lineNum = parseInt(m[1], 10) - 1;
+                } else if (line.startsWith("-")) {
+                  // Removed line: left side only, skip right-side counter.
+                } else {
+                  // Added (+) or context line: commentable.
+                  lineNum++;
+                  commentableLines[file.filename].add(lineNum);
+                }
+              }
+            }
+
+            // ── Split findings: inline vs. body-only ─────────────────────────
+            const inlineComments   = [];
+            const bodyOnlyFindings = [];
+
+            for (const c of rawComments) {
+              if (!c.path || !c.line || !c.body) continue;
+              const eligible = commentableLines[c.path]?.has(c.line);
+              if (eligible) {
+                inlineComments.push({
+                  path: c.path, line: c.line, side: "RIGHT", body: c.body,
+                });
+              } else {
+                bodyOnlyFindings.push(`**\`${c.path}:${c.line}\`** — ${c.body}`);
+              }
+            }
+
+            // ── Build review body ────────────────────────────────────────────
+            const MAX_BODY = 65_536;
+            let body = (review.summary || "").trim();
+            if (bodyOnlyFindings.length > 0) {
+              body +=
+                "\n\n---\n\n**Findings on non-diff lines:**\n" +
+                bodyOnlyFindings.map((f) => `- ${f}`).join("\n");
+            }
+            if (body.length > MAX_BODY) {
+              body = body.slice(0, MAX_BODY - 50) + "\n\n_[truncated]_";
+            }
+
+            // ── Map verdict ──────────────────────────────────────────────────
+            const validEvents = new Set(["APPROVE", "REQUEST_CHANGES", "COMMENT"]);
+            const event = validEvents.has(review.verdict) ? review.verdict : "COMMENT";
+
+            // ── Post PR review ───────────────────────────────────────────────
+            const { data: posted } = await github.rest.pulls.createReview({
+              owner,
+              repo,
+              pull_number,
+              commit_id,
+              event,
+              body,
+              comments: inlineComments,
+            });
+
+            core.setOutput("review_url", posted.html_url);
+            core.notice(`Claude review posted: ${posted.html_url}`);
+
+      # ---------------------------------------------------------------
+      # 7. Job summary.
+      # ---------------------------------------------------------------
+      - name: Write job summary
+        if: always()
+        shell: bash
+        env:
+          REVIEW_URL: ${{ steps.post_review.outputs.review_url }}
+          CLAUDE_OUTCOME: ${{ steps.claude.outcome }}
+        run: |
+          {
+            echo "## Claude PR Review"
+            echo
+            if [[ "$CLAUDE_OUTCOME" == "success" && -n "${REVIEW_URL:-}" ]]; then
+              echo "Review posted: $REVIEW_URL"
+            elif [[ "$CLAUDE_OUTCOME" == "failure" ]]; then
+              echo ":x: Claude did not produce a review. Check the step logs above."
+            else
+              echo ":warning: Review step outcome: $CLAUDE_OUTCOME"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
