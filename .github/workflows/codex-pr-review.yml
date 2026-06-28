@@ -27,8 +27,8 @@ on:
           runs. Use it to install project dependencies so Codex can invoke
           linters, type-checkers, or test runners during its review.
           Example: "npm ci" or "pip install -r requirements.txt".
-          The command runs with continue-on-error; a failure is logged but
-          does not abort the review.
+          Runs with continue-on-error; a failure is logged but does not
+          abort the review.
         required: false
         type: string
         default: ""
@@ -36,9 +36,9 @@ on:
     secrets:
       CODEX_ACCESS_TOKEN:
         description: >
-          Anthropic API key or Claude Code access token for the Codex CLI.
-          Store this as an org-level secret scoped to the repos that need it.
-          Never put it in this shared repo.
+          Claude Code access token (starts with "at-") or agent-identity JWT.
+          Obtain from claude.ai account settings. Store as an org-level secret
+          scoped to the repos that need it. Never put it in this shared repo.
         required: true
 
     outputs:
@@ -64,9 +64,9 @@ jobs:
       cancel-in-progress: false
 
     permissions:
-      contents: read       # checkout
-      issues: write        # post comment (issues API covers PR comments)
-      pull-requests: write # read PR metadata via gh CLI
+      contents: read        # checkout
+      issues: write         # post comment (issues API covers PR comments)
+      pull-requests: write  # read PR metadata via gh CLI
 
     outputs:
       comment_url: ${{ steps.post_comment.outputs.comment_url }}
@@ -128,7 +128,6 @@ jobs:
 
           base_ref="$(jq -r '.baseRefName' "$pr_json")"
 
-          # Build the context document that is appended to the prompt.
           {
             echo "# Pull request context"
             echo
@@ -188,10 +187,10 @@ jobs:
 
       # ---------------------------------------------------------------
       # 4. Optional: install project dependencies before Codex runs.
-      #    Callers pass pre_install_command for their stack
-      #    (e.g. "npm ci" or "pip install -r requirements.txt").
-      #    We continue-on-error and report the outcome in the prompt so
-      #    Codex knows whether tools like pytest or tsc are available.
+      #    Callers pass pre_install_command for their stack (e.g. "npm ci"
+      #    or "pip install -r requirements.txt"). Runs with continue-on-error;
+      #    outcome is reported in the prompt so Codex knows what tools are
+      #    available.
       # ---------------------------------------------------------------
       - name: Install project dependencies
         id: deps
@@ -206,9 +205,10 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "24"
 
       - name: Install Codex CLI
+        shell: bash
         run: npm install -g @openai/codex@${{ inputs.codex_version }}
 
       # ---------------------------------------------------------------
@@ -246,9 +246,17 @@ jobs:
           set -euo pipefail
 
           if [[ -z "${CODEX_ACCESS_TOKEN:-}" ]]; then
-            echo "::error::CODEX_ACCESS_TOKEN secret is not set. Add it as an org or repo secret named CODEX_ACCESS_TOKEN." >&2
+            echo "::error::CODEX_ACCESS_TOKEN secret is not set. Add it as an org or repo secret." >&2
             exit 1
           fi
+
+          # Log token class for debugging (never logs the value itself).
+          case "$CODEX_ACCESS_TOKEN" in
+            at-*)  echo "CODEX_ACCESS_TOKEN class: personal access token (at-)" ;;
+            *.*.*) echo "CODEX_ACCESS_TOKEN class: agent-identity JWT" ;;
+            *)     echo "CODEX_ACCESS_TOKEN class: other/opaque" ;;
+          esac
+          echo "CODEX_ACCESS_TOKEN length: ${#CODEX_ACCESS_TOKEN}"
 
           export CODEX_HOME="$RUNNER_TEMP/codex-home"
           mkdir -p "$CODEX_HOME"
@@ -257,8 +265,7 @@ jobs:
           review_file="$RUNNER_TEMP/review.md"
 
           # Use the caller repo's prompt if it exists; otherwise fall back to
-          # the built-in default. The prompt file is the right place for all
-          # repo-specific review instructions (stack, standards, lenses).
+          # the built-in default.
           repo_prompt=".github/codex/prompts/codex-pr-review.md"
           if [[ -f "$repo_prompt" ]]; then
             cat "$repo_prompt" > "$prompt_file"
@@ -295,17 +302,22 @@ jobs:
           - **API contracts** — removed or renamed fields, changed types, new required
             parameters that break existing callers.
 
+          ## Signal bar
+
+          Only report findings you are confident about. Do not flag style preferences
+          not enforced by the project linter, hypothetical future problems, or issues
+          outside the diff that pre-exist this PR.
+
           ## CI adapter rules
 
           - Do not edit, stage, commit, or push any file.
-          - Do not call `gh` commands directly. The workflow fetches PR metadata and
+          - Do not call gh commands directly. The workflow fetches PR metadata and
             posts your comment; use the pre-fetched context in this prompt.
-          - Produce **exactly one** Markdown comment body as your final answer.
-          - Start the comment with `<!-- codex-reviewer -->` on its own line.
+          - Produce exactly one Markdown comment body as your final answer.
+          - Start the comment with <!-- codex-reviewer --> on its own line.
 
           ## Comment structure
 
-          ```
           <!-- codex-reviewer -->
           _Codex review of `<sha>`_
 
@@ -325,19 +337,18 @@ jobs:
 
           ### Coverage
           Lenses applied: correctness, security, performance, reliability, tests, contracts
-          Validation run: <list any linters/tests/type-checks you ran, or "none — no pre_install_command set">
-          ```
+          Validation run: <list any linters/tests/type-checks you ran, or "none">
 
-          Report only concrete, high-signal findings. Omit findings you are not
-          confident about. If there are no issues, say so clearly and approve.
+          Report only concrete, high-signal findings. If there are no issues, say so
+          clearly and approve.
           BUILTIN_PROMPT
           fi
 
-          # Append runtime context so Codex knows the PR details and ref layout.
+          # Append runtime context.
           {
             echo
             echo "---"
-            echo "## Runtime context (injected by workflow — do not reproduce in output)"
+            echo "## Runtime context (injected by workflow)"
             echo
             cat "$RUNNER_TEMP/pr-context.md"
             echo
@@ -359,8 +370,7 @@ jobs:
               fi
             else
               echo "## Dependency installation"
-              echo "- No pre_install_command was set. Project tools (linters, type-checkers, test runners) are not pre-installed."
-              echo "- You may install them yourself if needed for validation."
+              echo "- No pre_install_command was set. Project tools are not pre-installed."
             fi
           } >> "$prompt_file"
 
@@ -386,9 +396,9 @@ jobs:
 
       # ---------------------------------------------------------------
       # 8. Post the review as a new PR comment.
-      #    Always post a new comment — never edit a prior one — so the
-      #    full history of reviews is visible as a chronological trail.
-      #    The <!-- codex-reviewer --> marker identifies Codex comments.
+      #    Always post new — never edit — so the chronological review
+      #    trail remains intact. The <!-- codex-reviewer --> marker
+      #    identifies Codex comments for tooling.
       # ---------------------------------------------------------------
       - name: Post Codex review comment
         id: post_comment
@@ -402,7 +412,7 @@ jobs:
           script: |
             const fs = require("fs");
 
-            const MAX_COMMENT_LENGTH = 65536; // GitHub hard limit on issue comments
+            const MAX_COMMENT_LENGTH = 65536;
             let body = fs.readFileSync(process.env.REVIEW_FILE, "utf8").trim();
             const issue_number = Number(process.env.PR_NUMBER);
             const { owner, repo } = context.repo;
@@ -417,7 +427,7 @@ jobs:
               );
             }
 
-            // Truncate gracefully rather than hard-failing if the review is huge.
+            // Truncate gracefully rather than hard-failing on oversized reviews.
             if (body.length > MAX_COMMENT_LENGTH) {
               const notice = "\n\n_Review truncated to fit GitHub's comment size limit._";
               body = body.slice(0, MAX_COMMENT_LENGTH - notice.length) + notice;
@@ -434,8 +444,8 @@ jobs:
             core.notice(`Codex review posted: ${created.data.html_url}`);
 
       # ---------------------------------------------------------------
-      # 9. Write a job summary so the review is visible in the Actions UI
-      #    without having to navigate to the PR.
+      # 9. Write a job summary so the review is visible in Actions UI
+      #    without navigating to the PR.
       # ---------------------------------------------------------------
       - name: Write job summary
         if: always()

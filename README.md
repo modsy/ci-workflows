@@ -55,7 +55,7 @@ lives here.
 
 | Secret | Required | Description |
 |---|---|---|
-| `CODEX_ACCESS_TOKEN` | Yes | Anthropic API key or Claude Code access token. Store as an org-level secret scoped to the repos that use it. |
+| `CODEX_ACCESS_TOKEN` | Yes | Claude Code access token (starts with `at-`) or agent-identity JWT. Obtain from claude.ai account settings. Store as an org-level secret scoped to the repos that use it. |
 
 ### Outputs
 
@@ -70,7 +70,9 @@ lives here.
 ### Step 1 — Add the org-level secret
 
 In your GitHub org settings, add an org secret named **`CODEX_ACCESS_TOKEN`**
-with your Anthropic API key. Scope it to the repos that need it.
+with your Claude Code access token (starts with `at-`). Obtain it from
+[claude.ai](https://claude.ai) account settings under API access. Scope it to
+the repos that need it.
 
 - **modsy**: `Settings > Secrets and variables > Actions > New org secret`
 - **product-org-len**: Same path.

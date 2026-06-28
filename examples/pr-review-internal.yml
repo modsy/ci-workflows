@@ -2,21 +2,28 @@
 #
 # Codex PR review — for repos with internal contributors only (no fork PRs).
 #
-# Uses the `pull_request` trigger, which runs in the context of the base branch
-# and does NOT grant access to secrets for fork PRs. No fork guard is needed.
+# Uses the `pull_request` trigger, which runs in the context of the PR branch
+# and does NOT expose repo secrets to fork contributors. No fork guard needed.
+#
+# Trigger choice:
+#   - opened:            review when a PR is first opened (non-draft).
+#   - ready_for_review:  review when a draft PR is marked ready. Pairs with
+#                        the draft skip in the caller template below: a PR
+#                        opened as a draft is skipped at "opened" and reviewed
+#                        once when marked ready.
+#
+# Not included: synchronize (new commits). Add it if you want Codex to re-
+# review on every push. Omitting it keeps costs predictable — one review per
+# PR lifecycle event, not one per push.
 #
 # Copy this file to .github/workflows/pr-review.yml in your service repo.
-# Adjust `pre_install_command` for your stack (or remove if not needed).
+# Adjust pre_install_command for your stack (or remove if not needed).
 
 name: PR Review
 
 on:
   pull_request:
-    # opened:          new PR — review immediately (unless draft)
-    # synchronize:     new commits pushed — review the updated PR
-    # reopened:        PR reopened after close
-    # ready_for_review: PR moved out of draft — review for the first time
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, ready_for_review]
 
   workflow_dispatch:
     inputs:
@@ -25,15 +32,15 @@ on:
         required: true
         type: number
 
-# Queue reviews for the same PR; never cancel a review that is already running.
+# Queue reviews for the same PR; never cancel a review already running.
 concurrency:
   group: codex-pr-review-${{ github.event.pull_request.number || inputs.pr_number }}
   cancel-in-progress: false
 
 jobs:
   codex-review:
-    # Skip draft PRs on push events. When a draft is marked ready, the
-    # ready_for_review event fires and this condition allows it through.
+    # Skip draft PRs. When a draft is marked ready, the ready_for_review event
+    # fires and this condition allows it through.
     if: >-
       github.event_name == 'workflow_dispatch' ||
       github.event.pull_request.draft == false
@@ -48,9 +55,9 @@ jobs:
       # Remove this line if your review prompt does not need them.
       #
       # Examples:
-      #   Django + React stack:  "cd backend && pip install -r requirements.txt && cd ../frontend && npm ci"
-      #   Python only:           "pip install -r requirements.txt"
       #   Node only:             "npm ci"
+      #   Python only:           "pip install -r requirements.txt"
+      #   Django + React stack:  "pip install -r requirements.txt && npm ci"
       pre_install_command: ""
 
       # Pin the Codex version for reproducible reviews.

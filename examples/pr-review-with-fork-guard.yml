@@ -2,18 +2,18 @@
 #
 # Codex PR review — for repos that receive pull requests from forks.
 #
-# Uses the `pull_request_target` trigger, which runs in the context of the
-# BASE branch and has access to repo secrets even for fork PRs. This is
-# necessary for manual reruns (workflow_dispatch) to work correctly.
+# Uses `pull_request_target`, which runs in the context of the BASE branch
+# and has access to repo secrets even for fork PRs. This is necessary for
+# workflow_dispatch reruns (manual re-trigger on any PR) to work correctly.
 #
 # SECURITY: pull_request_target + repo secrets + fork checkout = exfiltration
 # risk. The `if:` condition on the job is a MANDATORY fork guard. It restricts
-# automatic reviews to same-repo PRs only. workflow_dispatch is allowed
-# through so maintainers can manually trigger a review on any PR they trust.
+# automatic reviews to same-repo PRs only. workflow_dispatch is allowed through
+# so maintainers can manually trigger a review on any PR they inspect and trust.
 #
 # DO NOT remove or weaken the if: condition.
-# DO NOT check out the PR head with `persist-credentials: true` — the
-# reusable workflow already uses `persist-credentials: false`.
+# DO NOT check out the PR head with persist-credentials: true — the reusable
+# workflow already uses persist-credentials: false.
 #
 # Copy this file to .github/workflows/pr-review.yml in your service repo.
 
@@ -21,11 +21,9 @@ name: PR Review
 
 on:
   pull_request_target:
-    # opened:          new PR — review immediately (unless draft)
-    # synchronize:     new commits pushed — review the updated PR
-    # reopened:        PR reopened after close
-    # ready_for_review: PR moved out of draft — review for the first time
-    types: [opened, synchronize, reopened, ready_for_review]
+    # opened:            review when a PR is first opened (non-draft).
+    # ready_for_review:  review when a draft is marked ready.
+    types: [opened, ready_for_review]
 
   workflow_dispatch:
     inputs:
@@ -34,7 +32,7 @@ on:
         required: true
         type: number
 
-# Queue reviews for the same PR; never cancel a review that is already running.
+# Queue reviews for the same PR; never cancel a review already running.
 concurrency:
   group: codex-pr-review-${{ github.event.pull_request.number || inputs.pr_number }}
   cancel-in-progress: false
@@ -46,15 +44,14 @@ jobs:
     # Automatic reviews run only when both conditions hold:
     #   1. The PR head is in the same repo (not a fork). This prevents a
     #      malicious fork from triggering a run that has access to secrets.
-    #   2. The PR is not a draft. Draft reviews waste tokens on incomplete work.
+    #   2. The PR is not a draft.
     #
     # workflow_dispatch bypasses both checks so maintainers can manually
-    # review any PR (including fork PRs) that they have already inspected
-    # and decided to trust.
+    # review any PR (including fork PRs) they have already inspected and
+    # decided to trust.
     #
     # The guard MUST be on the job if: — not on a separate prerequisite job.
-    # A separate job can be skipped rather than failed, which does not block
-    # downstream jobs that use `needs:`.
+    # A skipped prerequisite job does not block downstream `needs:` dependents.
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (github.event.pull_request.head.repo.full_name == github.repository &&
@@ -66,17 +63,13 @@ jobs:
       pr_number: ${{ inputs.pr_number }}
 
       # Optional: install project dependencies before Codex runs.
-      # This lets Codex invoke linters, type-checkers, and test runners.
-      # Remove this line if your review prompt does not need them.
-      #
       # Examples:
-      #   Django + React stack:  "cd backend && pip install -r requirements.txt && cd ../frontend && npm ci"
-      #   Python only:           "pip install -r requirements.txt"
       #   Node only:             "npm ci"
+      #   Python only:           "pip install -r requirements.txt"
+      #   Django + React stack:  "pip install -r requirements.txt && npm ci"
       pre_install_command: ""
 
       # Pin the Codex version for reproducible reviews.
-      # Check https://www.npmjs.com/package/@openai/codex for the latest release.
       codex_version: "0.142.0"
 
     secrets:
