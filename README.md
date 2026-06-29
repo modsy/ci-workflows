@@ -2,7 +2,8 @@
 
 Shared reusable GitHub Actions workflows for Lennar engineering teams. The repo
 is public so callers in any org can reference it without cross-org agreements. No
-secrets or prompts live here; consuming repos supply those at call time.
+secrets live here (consuming repos pass those at call time); the review prompt **is**
+bundled here and applied to every caller, so consuming repos carry no review logic.
 
 ## Workflows
 
@@ -22,7 +23,7 @@ secrets or prompts live here; consuming repos supply those at call time.
    - Checks out the PR merge commit (`refs/pull/N/merge`) with `persist-credentials: false`.
    - Fetches PR metadata, the diff, and any linked issues.
    - Optionally runs `pre_install_command` (e.g. `npm ci`) and reports the outcome in the prompt.
-   - Reads the review prompt from `.github/codex/prompts/codex-pr-review.md` in the caller repo, or falls back to a built-in default.
+   - Reads the review prompt from **this shared repo** (`.github/codex/prompts/codex-pr-review.md`, version-locked to the workflow's own commit) — never from the PR under review. The prompt is stack-agnostic: it detects the stack and reads the repo's own `AGENTS.md` / `CLAUDE.md` for conventions. Consuming repos carry no prompt.
    - Runs the Codex CLI (`@openai/codex`) in ephemeral sandbox mode.
    - Parses the JSON response between `BEGIN_REVIEW_JSON` / `END_REVIEW_JSON` markers.
    - Posts a PR review (verdict plus inline comments) via `github.rest.pulls.createReview`.
@@ -33,7 +34,7 @@ secrets or prompts live here; consuming repos supply those at call time.
 |---|---|
 | Secrets isolation | `CODEX_ACCESS_TOKEN` / `CODEX_AUTH_JSON` are stored per org or repo and passed at call time. Never stored here. |
 | Fork PR exfiltration | Callers using `pull_request_target` must include the fork guard from the example (`if:` on the job, not a separate prerequisite job). |
-| Prompt privacy | The prompt lives in the caller repo and is read at runtime. |
+| Prompt integrity | The prompt is bundled in this shared repo and read from the workflow's own commit, never from the PR checkout. A PR cannot alter what the credentialed reviewer runs. |
 | Credential leak via git | `persist-credentials: false` removes `GITHUB_TOKEN` from git config, so scripts cannot push or fetch with it. |
 | Script injection | GitHub context values reach the shell as environment variables, never interpolated into `run:` scripts. |
 | Sandbox | Codex runs with `--ephemeral --sandbox workspace-write`: ephemeral container, no persistent state, write access scoped to the workspace. |
@@ -81,12 +82,6 @@ name: PR Review
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
-  workflow_dispatch:
-    inputs:
-      pr_number:
-        description: "PR number to review"
-        required: true
-        type: number
 
 permissions:
   contents: read
@@ -94,18 +89,20 @@ permissions:
   issues: write
 
 concurrency:
-  group: codex-pr-review-${{ github.event.pull_request.number || inputs.pr_number }}
+  group: codex-pr-review-${{ github.event.pull_request.number }}
   cancel-in-progress: false
 
 jobs:
   codex-review:
+    # Same-repo guard: never run for fork PRs (keeps credentials away from
+    # untrusted code). Do not add workflow_dispatch — an arbitrary PR number
+    # would bypass this guard.
     if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event.pull_request.head.repo.full_name == github.repository &&
-       github.event.pull_request.draft == false)
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.draft == false
     uses: modsy/ci-workflows/.github/workflows/codex-pr-review.yml@main
     with:
-      pr_number: ${{ github.event.pull_request.number || inputs.pr_number }}
+      pr_number: ${{ github.event.pull_request.number }}
       pre_install_command: "npm ci"   # "" for Python; add a build for monorepos
       codex_version: "0.142.0"
     secrets:
@@ -113,23 +110,14 @@ jobs:
       CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
 ```
 
-### 3. Add a prompt (recommended)
+### 3. That's it — no prompt to add
 
-Create `.github/codex/prompts/codex-pr-review.md` with your stack-specific review
-instructions. It must describe the stack, list the review dimensions, and instruct
-Codex to emit JSON between `BEGIN_REVIEW_JSON` / `END_REVIEW_JSON`:
-
-```json
-{
-  "verdict": "APPROVE | REQUEST_CHANGES | COMMENT",
-  "summary": "One paragraph.",
-  "comments": [{ "path": "src/file.ts", "line": 42, "body": "..." }]
-}
-```
-
-Without a prompt file, a built-in default is used. See
-[timmy's prompt](https://github.com/modsy/timmy/blob/main/.github/codex/prompts/codex-pr-review.md)
-for reference.
+Do **not** add a prompt to your repo. The review prompt is bundled in this shared
+repo ([`.github/codex/prompts/codex-pr-review.md`](.github/codex/prompts/codex-pr-review.md))
+and applied to every caller. It is stack-agnostic: it detects your stack and reads your
+repo's `AGENTS.md` / `CLAUDE.md` / `.agents/rules/` for project conventions. To change
+review behavior for everyone, edit the prompt here; to tune it for one repo, document the
+convention in that repo's `AGENTS.md`.
 
 ## Versioning
 

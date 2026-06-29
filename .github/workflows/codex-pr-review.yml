@@ -201,6 +201,21 @@ jobs:
           fi
 
       # ---------------------------------------------------------------
+      # 6b. Check out the review prompt from THIS shared repo (not the PR
+      #     under review). The prompt is trusted, version-locked to the
+      #     reusable workflow's own commit, and never sourced from the PR
+      #     checkout — so a PR cannot alter what the credentialed reviewer runs,
+      #     and consuming repos carry no prompt of their own.
+      # ---------------------------------------------------------------
+      - name: Check out shared review prompt
+        uses: actions/checkout@v4
+        with:
+          repository: modsy/ci-workflows
+          ref: ${{ github.job_workflow_sha || 'main' }}
+          path: .ci-shared
+          persist-credentials: false
+
+      # ---------------------------------------------------------------
       # 7. Run Codex. The prompt instructs JSON output between
       #    BEGIN_REVIEW_JSON / END_REVIEW_JSON markers so the posting
       #    step can post via createReview with inline diff comments,
@@ -253,14 +268,16 @@ jobs:
           prompt_file="$RUNNER_TEMP/codex-pr-review-prompt.md"
           review_file="$RUNNER_TEMP/codex-pr-review.md"
 
-          repo_prompt=".github/codex/prompts/codex-pr-review.md"
-          if [ ! -f "$repo_prompt" ]; then
-            echo "::error::No prompt found at $repo_prompt. Create it from examples/prompt-template.md." >&2
+          # Trusted prompt from this shared repo (checked out at .ci-shared),
+          # never from the PR under review.
+          shared_prompt="$GITHUB_WORKSPACE/.ci-shared/.github/codex/prompts/codex-pr-review.md"
+          if [ ! -f "$shared_prompt" ]; then
+            echo "::error::Shared prompt not found at $shared_prompt (modsy/ci-workflows)." >&2
             exit 1
           fi
 
           {
-            cat "$repo_prompt"
+            cat "$shared_prompt"
             echo
             echo "---"
             echo "## Runtime Context"
