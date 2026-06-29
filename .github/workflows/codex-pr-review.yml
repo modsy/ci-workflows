@@ -426,7 +426,18 @@ jobs:
               REQUEST_CHANGES: "Changes suggested",
               COMMENT: "Comments only",
             };
-            const verdictNote = VERDICT_LABEL[review.verdict] || VERDICT_LABEL.COMMENT;
+            // Normalize the model's verdict: uppercase and map common aliases
+            // (e.g. GitHub's CHANGES_REQUESTED, APPROVED) so the advisory label
+            // is accurate instead of silently falling back to "Comments only".
+            const VERDICT_ALIASES = {
+              CHANGES_REQUESTED: "REQUEST_CHANGES",
+              REQUEST_CHANGE: "REQUEST_CHANGES",
+              APPROVED: "APPROVE",
+              COMMENTED: "COMMENT",
+            };
+            const rawVerdict = String(review.verdict || "").trim().toUpperCase();
+            const verdictKey = VERDICT_ALIASES[rawVerdict] || rawVerdict;
+            const verdictNote = VERDICT_LABEL[verdictKey] || VERDICT_LABEL.COMMENT;
             const MAX_BODY = 65_536;
             let body = `<!-- codex-reviewer -->`;
             if (sha) body += `\n_Codex review of \`${sha}\`_`;
@@ -442,10 +453,10 @@ jobs:
             }
 
             // ── Always post as COMMENT (non-blocking, like GitHub Copilot) ────
-            // Codex never returns APPROVE/REQUEST_CHANGES — those set a blocking
-            // review state that resolving threads does not clear. We surface the
-            // model's verdict in the review body instead (see below) and always
-            // post the review itself as an advisory COMMENT.
+            // We never POST an APPROVE/REQUEST_CHANGES event — those set a
+            // blocking review state that resolving threads does not clear. The
+            // model's verdict is surfaced as advisory text in the body above;
+            // the posted review event is always COMMENT.
             const event = "COMMENT";
 
             // ── Post PR review (Copilot behavior) ────────────────────────────
