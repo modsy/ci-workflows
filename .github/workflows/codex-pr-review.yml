@@ -201,6 +201,21 @@ jobs:
           fi
 
       # ---------------------------------------------------------------
+      # 6b. Check out the review prompt from THIS shared repo (not the PR
+      #     under review). The prompt is trusted, version-locked to the
+      #     reusable workflow's own commit, and never sourced from the PR
+      #     checkout — so a PR cannot alter what the credentialed reviewer runs,
+      #     and consuming repos carry no prompt of their own.
+      # ---------------------------------------------------------------
+      - name: Check out shared review prompt
+        uses: actions/checkout@v4
+        with:
+          repository: modsy/ci-workflows
+          ref: ${{ github.job_workflow_sha || 'main' }}
+          path: .ci-shared
+          persist-credentials: false
+
+      # ---------------------------------------------------------------
       # 7. Run Codex. The prompt instructs JSON output between
       #    BEGIN_REVIEW_JSON / END_REVIEW_JSON markers so the posting
       #    step can post via createReview with inline diff comments,
@@ -253,14 +268,16 @@ jobs:
           prompt_file="$RUNNER_TEMP/codex-pr-review-prompt.md"
           review_file="$RUNNER_TEMP/codex-pr-review.md"
 
-          repo_prompt=".github/codex/prompts/codex-pr-review.md"
-          if [ ! -f "$repo_prompt" ]; then
-            echo "::error::No prompt found at $repo_prompt. Create it from examples/prompt-template.md." >&2
+          # Trusted prompt from this shared repo (checked out at .ci-shared),
+          # never from the PR under review.
+          shared_prompt="$GITHUB_WORKSPACE/.ci-shared/.github/codex/prompts/codex-pr-review.md"
+          if [ ! -f "$shared_prompt" ]; then
+            echo "::error::Shared prompt not found at $shared_prompt (modsy/ci-workflows)." >&2
             exit 1
           fi
 
           {
-            cat "$repo_prompt"
+            cat "$shared_prompt"
             echo
             echo "---"
             echo "## Runtime Context"
@@ -402,9 +419,29 @@ jobs:
             }
 
             // ── Build review body ────────────────────────────────────────────
+            // The review is always posted as a non-blocking COMMENT; surface the
+            // model's verdict here as advisory text instead of a blocking state.
+            const VERDICT_LABEL = {
+              APPROVE: "No blocking issues found",
+              REQUEST_CHANGES: "Changes suggested",
+              COMMENT: "Comments only",
+            };
+            // Normalize the model's verdict: uppercase and map common aliases
+            // (e.g. GitHub's CHANGES_REQUESTED, APPROVED) so the advisory label
+            // is accurate instead of silently falling back to "Comments only".
+            const VERDICT_ALIASES = {
+              CHANGES_REQUESTED: "REQUEST_CHANGES",
+              REQUEST_CHANGE: "REQUEST_CHANGES",
+              APPROVED: "APPROVE",
+              COMMENTED: "COMMENT",
+            };
+            const rawVerdict = String(review.verdict || "").trim().toUpperCase();
+            const verdictKey = VERDICT_ALIASES[rawVerdict] || rawVerdict;
+            const verdictNote = VERDICT_LABEL[verdictKey] || VERDICT_LABEL.COMMENT;
             const MAX_BODY = 65_536;
             let body = `<!-- codex-reviewer -->`;
             if (sha) body += `\n_Codex review of \`${sha}\`_`;
+            body += `\n\n**Verdict:** ${verdictNote} _(advisory — this review never blocks merge)_`;
             body += `\n\n${(review.summary || "").trim()}`;
             if (bodyOnlyFindings.length > 0) {
               body +=
@@ -415,9 +452,12 @@ jobs:
               body = body.slice(0, MAX_BODY - 50) + "\n\n_[truncated]_";
             }
 
-            // ── Map verdict ──────────────────────────────────────────────────
-            const validEvents = new Set(["APPROVE", "REQUEST_CHANGES", "COMMENT"]);
-            const event = validEvents.has(review.verdict) ? review.verdict : "COMMENT";
+            // ── Always post as COMMENT (non-blocking, like GitHub Copilot) ────
+            // We never POST an APPROVE/REQUEST_CHANGES event — those set a
+            // blocking review state that resolving threads does not clear. The
+            // model's verdict is surfaced as advisory text in the body above;
+            // the posted review event is always COMMENT.
+            const event = "COMMENT";
 
             // ── Post PR review (Copilot behavior) ────────────────────────────
             const { data: posted } = await github.rest.pulls.createReview({
