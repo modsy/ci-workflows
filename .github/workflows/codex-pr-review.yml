@@ -402,9 +402,18 @@ jobs:
             }
 
             // ── Build review body ────────────────────────────────────────────
+            // The review is always posted as a non-blocking COMMENT; surface the
+            // model's verdict here as advisory text instead of a blocking state.
+            const VERDICT_LABEL = {
+              APPROVE: "No blocking issues found",
+              REQUEST_CHANGES: "Changes suggested",
+              COMMENT: "Comments only",
+            };
+            const verdictNote = VERDICT_LABEL[review.verdict] || VERDICT_LABEL.COMMENT;
             const MAX_BODY = 65_536;
             let body = `<!-- codex-reviewer -->`;
             if (sha) body += `\n_Codex review of \`${sha}\`_`;
+            body += `\n\n**Verdict:** ${verdictNote} _(advisory — this review never blocks merge)_`;
             body += `\n\n${(review.summary || "").trim()}`;
             if (bodyOnlyFindings.length > 0) {
               body +=
@@ -415,9 +424,12 @@ jobs:
               body = body.slice(0, MAX_BODY - 50) + "\n\n_[truncated]_";
             }
 
-            // ── Map verdict ──────────────────────────────────────────────────
-            const validEvents = new Set(["APPROVE", "REQUEST_CHANGES", "COMMENT"]);
-            const event = validEvents.has(review.verdict) ? review.verdict : "COMMENT";
+            // ── Always post as COMMENT (non-blocking, like GitHub Copilot) ────
+            // Codex never returns APPROVE/REQUEST_CHANGES — those set a blocking
+            // review state that resolving threads does not clear. We surface the
+            // model's verdict in the review body instead (see below) and always
+            // post the review itself as an advisory COMMENT.
+            const event = "COMMENT";
 
             // ── Post PR review (Copilot behavior) ────────────────────────────
             const { data: posted } = await github.rest.pulls.createReview({
