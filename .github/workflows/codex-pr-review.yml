@@ -16,9 +16,11 @@ on:
 
       pre_install_command:
         description: >
-          Optional shell command run after checkout, before Codex. Use to
-          install project dependencies. Runs with continue-on-error; the
-          outcome is passed to Codex in the prompt.
+          Optional OVERRIDE for dependency setup. Leave empty (default) and the
+          workflow auto-detects the stack and installs deps for you — npm/yarn/
+          pnpm, uv/pip, or go — so the caller needs zero config. Set this only
+          for non-standard layouts (e.g. a package nested in a monorepo subdir).
+          Runs with continue-on-error; the outcome is passed to Codex.
         required: false
         type: string
         default: ""
@@ -166,17 +168,7 @@ jobs:
           echo "reviewed_sha=$reviewed_sha" >> "$GITHUB_OUTPUT"
 
       # ---------------------------------------------------------------
-      # 4. Optional: install project dependencies.
-      # ---------------------------------------------------------------
-      - name: Install project dependencies
-        id: deps
-        if: inputs.pre_install_command != ''
-        continue-on-error: true
-        shell: bash
-        run: ${{ inputs.pre_install_command }}
-
-      # ---------------------------------------------------------------
-      # 5. Set up Node.js and install Codex CLI.
+      # 4. Set up Node.js and install Codex CLI.
       # ---------------------------------------------------------------
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -185,6 +177,58 @@ jobs:
 
       - name: Install Codex CLI
         run: npm install -g @openai/codex@${{ inputs.codex_version }}
+
+      # ---------------------------------------------------------------
+      # 5. Install project dependencies. Zero-config: when the caller does not
+      #    set pre_install_command, auto-detect the stack and install. This is
+      #    why a caller is identical across repos. Best-effort: never fails the
+      #    job (continue-on-error), and the outcome is reported to Codex so it
+      #    knows whether it can run the repo's typecheck/tests.
+      # ---------------------------------------------------------------
+      - name: Install project dependencies
+        id: deps
+        continue-on-error: true
+        shell: bash
+        env:
+          PRE_INSTALL_CMD: ${{ inputs.pre_install_command }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${PRE_INSTALL_CMD:-}" ]; then
+            echo "method=override: ${PRE_INSTALL_CMD}" >> "$GITHUB_OUTPUT"
+            echo "Running caller-provided pre_install_command: ${PRE_INSTALL_CMD}"
+            eval "${PRE_INSTALL_CMD}"
+            exit 0
+          fi
+
+          # Auto-detect from repo-root manifests.
+          if [ -f package.json ]; then
+            if [ -f pnpm-lock.yaml ]; then
+              corepack enable && pnpm install --frozen-lockfile; method="pnpm install --frozen-lockfile"
+            elif [ -f yarn.lock ]; then
+              corepack enable && yarn install --frozen-lockfile; method="yarn install --frozen-lockfile"
+            elif [ -f package-lock.json ]; then
+              npm ci; method="npm ci"
+            else
+              npm install; method="npm install"
+            fi
+            if grep -q '"workspaces"' package.json 2>/dev/null; then
+              npm run build --workspaces --if-present; method="${method} + build workspaces"
+            fi
+          elif [ -f uv.lock ]; then
+            command -v uv >/dev/null 2>&1 || pip install --quiet uv
+            uv sync --frozen 2>/dev/null || uv sync; method="uv sync"
+          elif [ -f requirements.txt ]; then
+            pip install --quiet -r requirements.txt; method="pip install -r requirements.txt"
+          elif [ -f pyproject.toml ]; then
+            pip install --quiet -e . 2>/dev/null || pip install --quiet .; method="pip install ."
+          elif [ -f go.mod ]; then
+            go mod download; method="go mod download"
+          else
+            method="none detected (no root manifest)"
+          fi
+          echo "method=${method}" >> "$GITHUB_OUTPUT"
+          echo "Dependency setup: ${method}"
 
       # ---------------------------------------------------------------
       # 6. Enable unprivileged user namespaces for bubblewrap.
@@ -231,7 +275,7 @@ jobs:
           BASE_REF: ${{ steps.context.outputs.base_ref }}
           REVIEWED_SHA: ${{ steps.context.outputs.reviewed_sha }}
           DEPS_OUTCOME: ${{ steps.deps.outcome }}
-          PRE_INSTALL_CMD: ${{ inputs.pre_install_command }}
+          DEPS_METHOD: ${{ steps.deps.outputs.method }}
         run: |
           set -euo pipefail
 
@@ -290,10 +334,8 @@ jobs:
             echo "- Review only this PR's changes: git diff HEAD^1...HEAD"
             echo "- Scope to one file: git diff HEAD^1...HEAD -- <path>"
             echo "- Reviewed SHA: ${REVIEWED_SHA}"
-            if [ -n "${PRE_INSTALL_CMD:-}" ]; then
-              echo "- Dependency install command: ${PRE_INSTALL_CMD}"
-              echo "- Dependency install outcome: ${DEPS_OUTCOME:-not run}"
-            fi
+            echo "- Dependency setup: ${DEPS_METHOD:-none} (outcome: ${DEPS_OUTCOME:-not run})"
+            echo "- If the install outcome is success, you may run the repo's own typecheck/test commands; otherwise review statically."
           } > "$prompt_file"
 
           codex exec \
@@ -438,10 +480,23 @@ jobs:
             const rawVerdict = String(review.verdict || "").trim().toUpperCase();
             const verdictKey = VERDICT_ALIASES[rawVerdict] || rawVerdict;
             const verdictNote = VERDICT_LABEL[verdictKey] || VERDICT_LABEL.COMMENT;
+            // Compact findings count by severity (e.g. "2 issues · 1 suggestion").
+            const counts = { blocking: 0, suggestion: 0, nitpick: 0 };
+            for (const c of rawComments) {
+              const sev = String(c.severity || "suggestion").toLowerCase();
+              if (counts[sev] !== undefined) counts[sev]++;
+            }
+            const plural = (n, w) => `${n} ${w}${n === 1 ? "" : "s"}`;
+            const parts = [];
+            if (counts.blocking) parts.push(plural(counts.blocking, "issue"));
+            if (counts.suggestion) parts.push(plural(counts.suggestion, "suggestion"));
+            if (counts.nitpick) parts.push(plural(counts.nitpick, "nitpick"));
+            const findingsLine = parts.length ? parts.join(" · ") : "no inline findings";
+
             const MAX_BODY = 65_536;
             let body = `<!-- codex-reviewer -->`;
             if (sha) body += `\n_Codex review of \`${sha}\`_`;
-            body += `\n\n**Verdict:** ${verdictNote} _(advisory — this review never blocks merge)_`;
+            body += `\n\n**Verdict:** ${verdictNote} — ${findingsLine} _(advisory; never blocks merge)_`;
             body += `\n\n${(review.summary || "").trim()}`;
             if (bodyOnlyFindings.length > 0) {
               body +=
