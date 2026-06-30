@@ -22,7 +22,7 @@ bundled here and applied to every caller, so consuming repos carry no review log
 3. The workflow:
    - Checks out the PR merge commit (`refs/pull/N/merge`) with `persist-credentials: false`.
    - Fetches PR metadata, the diff, and any linked issues.
-   - Optionally runs `pre_install_command` (e.g. `npm ci`) and reports the outcome in the prompt.
+   - Auto-detects the stack and installs dependencies (npm/yarn/pnpm, uv/pip, go) — zero config. `pre_install_command` is an optional override for non-standard layouts.
    - Reads the review prompt from **this shared repo** (`.github/codex/prompts/codex-pr-review.md`, version-locked to the workflow's own commit) — never from the PR under review. The prompt is stack-agnostic: it detects the stack and reads the repo's own `AGENTS.md` / `CLAUDE.md` for conventions. Consuming repos carry no prompt.
    - Runs the Codex CLI (`@openai/codex`) in ephemeral sandbox mode.
    - Parses the JSON response between `BEGIN_REVIEW_JSON` / `END_REVIEW_JSON` markers.
@@ -45,7 +45,7 @@ bundled here and applied to every caller, so consuming repos carry no review log
 |---|---|---|---|---|
 | `pr_number` | number | No | auto | PR to review. Auto-resolved from the event; pass explicitly for `workflow_dispatch`. |
 | `codex_version` | string | No | `0.142.0` | Pinned `@openai/codex` version. Pin in the caller for reproducible reviews. |
-| `pre_install_command` | string | No | `""` | Command run before review (e.g. `npm ci`). Runs with `continue-on-error`; the outcome is reported in the prompt. |
+| `pre_install_command` | string | No | `""` | Optional override for dependency setup. Leave empty and the stack is auto-detected (npm/yarn/pnpm, uv/pip, go). Set only for non-standard layouts (e.g. a package in a monorepo subdir). |
 
 ### Secrets
 
@@ -103,7 +103,6 @@ jobs:
     uses: modsy/ci-workflows/.github/workflows/codex-pr-review.yml@main
     with:
       pr_number: ${{ github.event.pull_request.number }}
-      pre_install_command: "npm ci"   # "" for Python; add a build for monorepos
       codex_version: "0.142.0"
     secrets:
       CODEX_ACCESS_TOKEN: ${{ secrets.CODEX_ACCESS_TOKEN }}
@@ -136,7 +135,7 @@ uses: modsy/ci-workflows/.github/workflows/codex-pr-review.yml@<sha>
 | "invalid agent identity JWT format" | The `CODEX_ACCESS_TOKEN` value is not a valid JWT/PAT. Use `CODEX_AUTH_JSON` instead. |
 | "Cannot resolve a PR number" | Pass `pr_number` when triggering via `workflow_dispatch`. |
 | Fork PRs not reviewed | Intentional under `pull_request_target`. A maintainer can trigger a review via `workflow_dispatch` after inspecting the fork. |
-| `pre_install_command` fails | Install is `continue-on-error`; the prompt reports it. Fix the command, or build workspaces for monorepos. |
+| Dependencies not installed | Auto-detect is best-effort and `continue-on-error`; the review still runs statically. For a nested monorepo package, set `pre_install_command` to your install command. |
 | bubblewrap / sandbox errors | The workflow sets `kernel.unprivileged_userns_clone=1` for Linux runners, required by Codex's sandbox. |
 
 ## Contributing
