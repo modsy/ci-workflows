@@ -199,7 +199,13 @@ jobs:
 
           if [ -n "$last_reviewed_sha" ]; then
             full_last="$(git rev-parse "${last_reviewed_sha}" 2>/dev/null || true)"
-            if [ -n "$full_last" ] && [ "$full_last" = "$head_sha" ]; then
+            if [ -z "$full_last" ]; then
+              # The last-reviewed commit is not in this checkout (e.g. it was
+              # force-pushed away). Fall back to a full-PR review rather than
+              # asking Codex to diff from a SHA that no longer exists.
+              echo "Prior reviewed SHA ${last_reviewed_sha} not present in checkout; reviewing the full PR."
+              last_reviewed_sha=""
+            elif [ "$full_last" = "$head_sha" ]; then
               already_reviewed="true"
               echo "::notice::HEAD ${reviewed_sha} already has a Codex review. Skipping."
             else
@@ -497,10 +503,12 @@ jobs:
             // reviewer never re-raises a point it already made.
             let botCommentedLocations = new Set();
             try {
-              const { data: existingReviewComments } =
-                await github.rest.pulls.listReviewComments({
-                  owner, repo, pull_number, per_page: 100,
-                });
+              // Paginate: a redundantly-reviewed PR can accumulate >100 bot
+              // comments, and a missed page would let duplicates slip through.
+              const existingReviewComments = await github.paginate(
+                github.rest.pulls.listReviewComments,
+                { owner, repo, pull_number, per_page: 100 },
+              );
               for (const c of existingReviewComments) {
                 const isBot =
                   c.user.type === "Bot" ||
