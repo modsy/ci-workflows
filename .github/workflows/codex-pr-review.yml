@@ -704,7 +704,11 @@ jobs:
             const SEV_RANK = { blocking: 3, suggestion: 2, nitpick: 1 };
             const minSevRaw = String(process.env.INLINE_MIN_SEVERITY || "suggestion").toLowerCase();
             const floor = SEV_RANK[minSevRaw] ?? SEV_RANK.suggestion;
-            const maxInline = Number(process.env.MAX_INLINE_COMMENTS) || 10;
+            // Parse to a non-negative integer, honoring an explicit 0
+            // (0 => no inline threads, everything in the body). Fall back to
+            // 10 only for missing/invalid values.
+            const parsedMax = parseInt(process.env.MAX_INLINE_COMMENTS, 10);
+            const maxInline = Number.isInteger(parsedMax) && parsedMax >= 0 ? parsedMax : 10;
             const summaryOnly = process.env.SUMMARY_ONLY === "true";
 
             const inlineCandidates = []; // {path, line, side, body, rank}
@@ -744,7 +748,13 @@ jobs:
 
             // Cap inline threads: keep the highest-severity findings inline,
             // list the overflow in the body.
-            inlineCandidates.sort((a, b) => b.rank - a.rank);
+            // Severity first; then a deterministic tie-break on path+line so the
+            // kept "top N" is stable across runs for the same set of findings.
+            inlineCandidates.sort((a, b) =>
+              b.rank - a.rank ||
+              a.path.localeCompare(b.path) ||
+              a.line - b.line
+            );
             const inlineComments = inlineCandidates
               .slice(0, maxInline)
               .map(({ path, line, side, body }) => ({ path, line, side, body }));
