@@ -59,6 +59,12 @@ jobs:
     name: Review PR with Codex
     runs-on: ubuntu-latest
 
+    # One active review per PR at a time. A new push cancels the in-flight
+    # review of the prior commit so only HEAD is ever reviewed.
+    concurrency:
+      group: codex-pr-review-${{ github.repository }}-${{ github.event.pull_request.number || inputs.pr_number }}
+      cancel-in-progress: true
+
     permissions:
       contents: read
       pull-requests: write
@@ -105,6 +111,9 @@ jobs:
       # ---------------------------------------------------------------
       # 3. Fetch PR metadata, linked issues, and stamp the head SHA
       #    before Codex runs so a push mid-review cannot mislabel it.
+      #
+      #    Also checks for a prior bot review at this exact HEAD SHA and
+      #    records the last-reviewed SHA for incremental diff mode.
       # ---------------------------------------------------------------
       - name: Fetch PR metadata and refs
         id: context
@@ -163,19 +172,58 @@ jobs:
             } >> "$RUNNER_TEMP/pr-context.md"
           fi
 
-          echo "base_ref=$base_ref"         >> "$GITHUB_OUTPUT"
-          echo "head_sha=$head_sha"         >> "$GITHUB_OUTPUT"
-          echo "reviewed_sha=$reviewed_sha" >> "$GITHUB_OUTPUT"
+          # ------------------------------------------------------------------
+          # Idempotency: check whether the bot already reviewed this exact HEAD.
+          # Look at all PR reviews from Bot accounts that contain our marker.
+          # Extract the most recent reviewed SHA from the marker pattern:
+          #   _Codex review of `<sha>`_
+          # If that SHA resolves to the current head_sha, skip the whole review.
+          # If it resolves to a prior commit, record it for incremental diff mode.
+          # ------------------------------------------------------------------
+          already_reviewed="false"
+          last_reviewed_sha=""
+
+          bot_reviews="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/reviews" \
+            --paginate \
+            --jq '[.[] | select(
+              (.user.type == "Bot" or (.user.login | ascii_downcase | test("bot|github-actions")))
+              and (.body // "" | contains("<!-- codex-reviewer -->"))
+            ) | .body]' 2>/dev/null | jq -s 'add // []' || echo "[]")"
+
+          last_reviewed_sha="$(printf '%s' "$bot_reviews" \
+            | jq -r 'reverse | .[] |
+                match("Codex review of `(?P<sha>[a-f0-9]{7,40})`") |
+                .captures[] | select(.name == "sha") | .string' \
+            | head -1 || true)"
+
+          if [ -n "$last_reviewed_sha" ]; then
+            full_last="$(git rev-parse "${last_reviewed_sha}" 2>/dev/null || true)"
+            if [ -n "$full_last" ] && [ "$full_last" = "$head_sha" ]; then
+              already_reviewed="true"
+              echo "::notice::HEAD ${reviewed_sha} already has a Codex review. Skipping."
+            else
+              echo "Prior review found at ${last_reviewed_sha}; will review incrementally from that SHA."
+            fi
+          fi
+
+          echo "base_ref=$base_ref"               >> "$GITHUB_OUTPUT"
+          echo "head_sha=$head_sha"               >> "$GITHUB_OUTPUT"
+          echo "reviewed_sha=$reviewed_sha"       >> "$GITHUB_OUTPUT"
+          echo "already_reviewed=$already_reviewed" >> "$GITHUB_OUTPUT"
+          echo "last_reviewed_sha=$last_reviewed_sha" >> "$GITHUB_OUTPUT"
 
       # ---------------------------------------------------------------
       # 4. Set up Node.js and install Codex CLI.
       # ---------------------------------------------------------------
       - name: Set up Node.js
+        if: steps.context.outputs.already_reviewed != 'true'
         uses: actions/setup-node@v4
         with:
           node-version: "24"
 
       - name: Install Codex CLI
+        if: steps.context.outputs.already_reviewed != 'true'
         run: npm install -g @openai/codex@${{ inputs.codex_version }}
 
       # ---------------------------------------------------------------
@@ -187,6 +235,7 @@ jobs:
       # ---------------------------------------------------------------
       - name: Install project dependencies
         id: deps
+        if: steps.context.outputs.already_reviewed != 'true'
         continue-on-error: true
         shell: bash
         env:
@@ -234,6 +283,7 @@ jobs:
       # 6. Enable unprivileged user namespaces for bubblewrap.
       # ---------------------------------------------------------------
       - name: Enable unprivileged user namespaces for bubblewrap
+        if: steps.context.outputs.already_reviewed != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -252,6 +302,7 @@ jobs:
       #     and consuming repos carry no prompt of their own.
       # ---------------------------------------------------------------
       - name: Check out shared review prompt
+        if: steps.context.outputs.already_reviewed != 'true'
         uses: actions/checkout@v4
         with:
           repository: modsy/ci-workflows
@@ -264,9 +315,14 @@ jobs:
       #    BEGIN_REVIEW_JSON / END_REVIEW_JSON markers so the posting
       #    step can post via createReview with inline diff comments,
       #    identical to GitHub Copilot review behavior.
+      #
+      #    When a prior bot review exists at an earlier SHA, the prompt
+      #    tells Codex to review only the incremental diff since that SHA
+      #    rather than the full PR diff, avoiding re-raising stale issues.
       # ---------------------------------------------------------------
       - name: Run Codex PR review
         id: codex
+        if: steps.context.outputs.already_reviewed != 'true'
         shell: bash
         env:
           CODEX_ACCESS_TOKEN: ${{ secrets.CODEX_ACCESS_TOKEN }}
@@ -274,6 +330,7 @@ jobs:
           PR_NUMBER: ${{ steps.pr.outputs.number }}
           BASE_REF: ${{ steps.context.outputs.base_ref }}
           REVIEWED_SHA: ${{ steps.context.outputs.reviewed_sha }}
+          LAST_REVIEWED_SHA: ${{ steps.context.outputs.last_reviewed_sha }}
           DEPS_OUTCOME: ${{ steps.deps.outcome }}
           DEPS_METHOD: ${{ steps.deps.outputs.method }}
         run: |
@@ -331,11 +388,23 @@ jobs:
             echo "## Checkout and refs"
             echo "- HEAD is refs/pull/${PR_NUMBER}/merge: GitHub's merge of this PR into ${BASE_REF}."
             echo "- Its first parent (HEAD^1) is the ${BASE_REF} base; the second parent (HEAD^2) is the PR head."
-            echo "- Review only this PR's changes: git diff HEAD^1...HEAD"
-            echo "- Scope to one file: git diff HEAD^1...HEAD -- <path>"
-            echo "- Reviewed SHA: ${REVIEWED_SHA}"
+            echo "- Reviewed SHA (current PR head): ${REVIEWED_SHA}"
             echo "- Dependency setup: ${DEPS_METHOD:-none} (outcome: ${DEPS_OUTCOME:-not run})"
             echo "- If the install outcome is success, you may run the repo's own typecheck/test commands; otherwise review statically."
+            echo
+            if [ -n "${LAST_REVIEWED_SHA:-}" ]; then
+              echo "## Incremental review"
+              echo "A prior Codex review was already posted for commit ${LAST_REVIEWED_SHA}."
+              echo "Review ONLY the changes introduced since that commit — do not re-raise issues"
+              echo "that were already visible in that earlier review."
+              echo "- Incremental diff command: git diff ${LAST_REVIEWED_SHA}...HEAD^2"
+              echo "- Full PR diff for context only: git diff HEAD^1...HEAD"
+              echo "- Scope to one file: git diff ${LAST_REVIEWED_SHA}...HEAD^2 -- <path>"
+            else
+              echo "## Diff scope"
+              echo "- Review only this PR's changes: git diff HEAD^1...HEAD"
+              echo "- Scope to one file: git diff HEAD^1...HEAD -- <path>"
+            fi
           } > "$prompt_file"
 
           codex exec \
@@ -373,6 +442,10 @@ jobs:
       # 8. Post the review.
       #    Happy path: createReview with inline diff comments (Copilot behavior).
       #    Fallback: plain PR comment if JSON parsing failed.
+      #
+      #    Before posting, existing bot review comments are fetched and any
+      #    finding that duplicates an already-posted file:line comment is
+      #    suppressed to prevent repeated reports across pushes.
       # ---------------------------------------------------------------
       - name: Post Codex review
         id: post_review
@@ -418,6 +491,32 @@ jobs:
             );
             const rawComments = Array.isArray(review.comments) ? review.comments : [];
 
+            // ── Fetch existing bot review comments to suppress duplicates ─────
+            // Any finding at a file:line already flagged by a prior bot review
+            // is dropped before posting, regardless of resolved state, so the
+            // reviewer never re-raises a point it already made.
+            let botCommentedLocations = new Set();
+            try {
+              const { data: existingReviewComments } =
+                await github.rest.pulls.listReviewComments({
+                  owner, repo, pull_number, per_page: 100,
+                });
+              for (const c of existingReviewComments) {
+                const isBot =
+                  c.user.type === "Bot" ||
+                  c.user.login === "github-actions[bot]";
+                if (isBot) {
+                  const line = c.original_line ?? c.line;
+                  if (c.path && line) {
+                    botCommentedLocations.add(`${c.path}:${line}`);
+                  }
+                }
+              }
+              core.info(`Existing bot comment locations: ${botCommentedLocations.size}`);
+            } catch (err) {
+              core.warning(`Could not fetch existing review comments: ${err.message}`);
+            }
+
             // ── Fetch diff to validate commentable line numbers ──────────────
             // The GitHub API only accepts inline comments on lines present in
             // the diff (added or context on the RIGHT side). Invalid lines
@@ -445,12 +544,22 @@ jobs:
               }
             }
 
-            // ── Split: inline vs body-only ───────────────────────────────────
+            // ── Split: inline vs body-only, suppressing duplicates ───────────
             const inlineComments   = [];
             const bodyOnlyFindings = [];
+            let suppressedCount    = 0;
 
             for (const c of rawComments) {
               if (!c.path || !c.line || !c.body) continue;
+
+              // Suppress findings at file:line already commented by the bot.
+              const locationKey = `${c.path}:${c.line}`;
+              if (botCommentedLocations.has(locationKey)) {
+                core.info(`Suppressed duplicate finding at ${locationKey}`);
+                suppressedCount++;
+                continue;
+              }
+
               if (commentableLines[c.path]?.has(c.line)) {
                 inlineComments.push({
                   path: c.path, line: c.line, side: "RIGHT", body: c.body,
@@ -458,6 +567,10 @@ jobs:
               } else {
                 bodyOnlyFindings.push(`**\`${c.path}:${c.line}\`** — ${c.body}`);
               }
+            }
+
+            if (suppressedCount > 0) {
+              core.info(`Suppressed ${suppressedCount} duplicate finding(s) from prior reviews.`);
             }
 
             // ── Build review body ────────────────────────────────────────────
@@ -498,6 +611,9 @@ jobs:
             if (sha) body += `\n_Codex review of \`${sha}\`_`;
             body += `\n\n**Verdict:** ${verdictNote} — ${findingsLine} _(advisory; never blocks merge)_`;
             body += `\n\n${(review.summary || "").trim()}`;
+            if (suppressedCount > 0) {
+              body += `\n\n_${suppressedCount} finding(s) suppressed — already raised in a prior review._`;
+            }
             if (bodyOnlyFindings.length > 0) {
               body +=
                 "\n\n---\n\n**Findings on non-diff lines:**\n" +
@@ -537,11 +653,14 @@ jobs:
         env:
           REVIEW_URL: ${{ steps.post_review.outputs.review_url }}
           CODEX_OUTCOME: ${{ steps.codex.outcome }}
+          ALREADY_REVIEWED: ${{ steps.context.outputs.already_reviewed }}
         run: |
           {
             echo "## Codex PR Review"
             echo
-            if [ "$CODEX_OUTCOME" = "success" ] && [ -n "${REVIEW_URL:-}" ]; then
+            if [ "${ALREADY_REVIEWED:-false}" = "true" ]; then
+              echo "Skipped: HEAD was already reviewed by a prior run."
+            elif [ "$CODEX_OUTCOME" = "success" ] && [ -n "${REVIEW_URL:-}" ]; then
               echo "Review posted: $REVIEW_URL"
             elif [ "$CODEX_OUTCOME" = "failure" ]; then
               echo ":x: Codex did not produce a review. Check the step logs above."
