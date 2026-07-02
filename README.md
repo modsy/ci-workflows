@@ -107,6 +107,14 @@ prompt** — it's bundled here and applied to every caller.
 | `pr_number` | No | auto | PR to review. Resolved from the triggering event; the caller above passes it explicitly. |
 | `codex_version` | No | `0.142.0` | Pinned `@openai/codex` version. |
 | `pre_install_command` | No | `""` | Optional **override** for dependency setup. Leave empty for auto-detect. Set only for non-standard layouts (e.g. a package nested in a monorepo subdir). |
+| `inline_min_severity` | No | `suggestion` | Minimum severity that opens an inline thread (`blocking`/`suggestion`/`nitpick`). Findings below the floor go under "Minor notes" in the body. The default keeps nitpicks out of threads. |
+| `max_inline_comments` | No | `10` | Cap on inline threads per run. Highest-severity findings stay inline; the rest are listed in the body. |
+| `debounce_seconds` | No | `30` | Pause at job start, then re-resolve the PR head. If a newer commit landed, the run exits so a burst of pushes collapses to one review. Set `0` to disable. |
+
+**Reducing thread churn.** The reviewer skips while a PR is a draft or carries the
+`codex:pause` label, and resumes when the PR is marked ready or the label is removed.
+Docs/test-only increments post as summary notes with no inline threads. These behaviors
+are advisory and never block merge.
 
 ## Secrets
 

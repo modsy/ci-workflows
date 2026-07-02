@@ -3,6 +3,19 @@ name: Codex PR Review (Reusable)
 # Auth pattern: product-org-len/atlas-pp-sxs-tool-app (Vincent's implementation)
 # Output pattern: GitHub Copilot (PR review with inline diff comments + verdict)
 # See examples/ for ready-to-use caller workflows.
+#
+# Noise controls (all advisory, none block merge):
+#   - Pause while iterating: the review is skipped when the PR is a draft or
+#     carries the "codex:pause" label, and resumes automatically once the PR is
+#     marked ready or the label is removed.
+#   - Debounce bursts: a short pause at job start re-resolves the PR head; if a
+#     newer commit landed, this run exits so a rapid fix sequence collapses to a
+#     single review of the final state (see debounce_seconds).
+#   - Severity floor: only findings at or above inline_min_severity become
+#     inline threads; anything below is listed under "Minor notes" in the body.
+#   - Inline cap: at most max_inline_comments inline threads per run; the rest
+#     are listed in the body.
+#   - Docs/test-only increments post as summary notes, with no inline threads.
 
 on:
   workflow_call:
@@ -32,6 +45,36 @@ on:
         required: false
         type: string
         default: "0.142.0"
+
+      inline_min_severity:
+        description: >
+          Minimum severity that is posted as an inline review comment (each
+          inline comment opens a thread the author must resolve). One of:
+          blocking | suggestion | nitpick. Findings below this floor are listed
+          in the review summary body under "Minor notes" instead of opening
+          threads. Default "suggestion" keeps nitpicks out of threads entirely.
+        required: false
+        type: string
+        default: "suggestion"
+
+      max_inline_comments:
+        description: >
+          Maximum inline review comments to post in a single run. The
+          highest-severity findings are kept inline; any overflow is listed in
+          the summary body. Stops one push from spawning a wall of threads.
+        required: false
+        type: number
+        default: 10
+
+      debounce_seconds:
+        description: >
+          Brief pause at job start before re-resolving the PR head. If a newer
+          commit landed during the pause, this run exits without reviewing, so a
+          rapid burst of pushes collapses to a single review of the final state.
+          Set 0 to disable.
+        required: false
+        type: number
+        default: 30
 
     secrets:
       CODEX_ACCESS_TOKEN:
@@ -126,10 +169,14 @@ jobs:
 
           pr_json="$RUNNER_TEMP/pr.json"
           gh pr view "$PR_NUMBER" \
-            --json number,title,body,url,baseRefName,baseRefOid,headRefName,headRefOid,isDraft,author \
+            --json number,title,body,url,baseRefName,baseRefOid,headRefName,headRefOid,isDraft,author,labels \
             > "$pr_json"
 
           base_ref="$(jq -r '.baseRefName' "$pr_json")"
+
+          # Pause gates: skip while the PR is a draft or carries codex:pause.
+          is_draft="$(jq -r '.isDraft' "$pr_json")"
+          paused="$(jq -r '[.labels[].name] | index("codex:pause") | if . == null then "false" else "true" end' "$pr_json")"
 
           # Capture the true PR head SHA before Codex runs.
           reviewed_sha="$(git rev-parse --short=7 'HEAD^2' 2>/dev/null \
@@ -218,18 +265,75 @@ jobs:
           echo "reviewed_sha=$reviewed_sha"       >> "$GITHUB_OUTPUT"
           echo "already_reviewed=$already_reviewed" >> "$GITHUB_OUTPUT"
           echo "last_reviewed_sha=$last_reviewed_sha" >> "$GITHUB_OUTPUT"
+          echo "is_draft=$is_draft"               >> "$GITHUB_OUTPUT"
+          echo "paused=$paused"                   >> "$GITHUB_OUTPUT"
+
+      # ---------------------------------------------------------------
+      # 3b. Debounce rapid pushes. Sleep briefly, then re-resolve the PR head.
+      #     If HEAD advanced during the pause, a newer run will handle the final
+      #     state, so exit this one. Skipped when we already know we will not
+      #     review (already-reviewed / draft / paused), to avoid a pointless wait.
+      # ---------------------------------------------------------------
+      - name: Debounce rapid pushes
+        id: debounce
+        if: >-
+          steps.context.outputs.already_reviewed != 'true' &&
+          steps.context.outputs.is_draft != 'true' &&
+          steps.context.outputs.paused != 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          TRIGGER_SHA: ${{ steps.context.outputs.head_sha }}
+          DEBOUNCE_SECONDS: ${{ inputs.debounce_seconds }}
+        run: |
+          set -euo pipefail
+          superseded="false"
+          secs="${DEBOUNCE_SECONDS:-30}"
+          if [ "${secs}" -gt 0 ] 2>/dev/null; then
+            sleep "${secs}"
+            current="$(gh pr view "$PR_NUMBER" --json headRefOid --jq '.headRefOid' 2>/dev/null || true)"
+            if [ -n "$current" ] && [ "$current" != "$TRIGGER_SHA" ]; then
+              echo "::notice::HEAD advanced from ${TRIGGER_SHA:0:7} to ${current:0:7} during debounce; a newer run will review. Exiting."
+              superseded="true"
+            fi
+          fi
+          echo "superseded=${superseded}" >> "$GITHUB_OUTPUT"
+
+      # ---------------------------------------------------------------
+      # 3c. Single review gate. Collapse all skip reasons into one output the
+      #     downstream steps read, so their conditions stay simple.
+      # ---------------------------------------------------------------
+      - name: Compute review gate
+        id: gate
+        shell: bash
+        env:
+          ALREADY_REVIEWED: ${{ steps.context.outputs.already_reviewed }}
+          IS_DRAFT: ${{ steps.context.outputs.is_draft }}
+          PAUSED: ${{ steps.context.outputs.paused }}
+          SUPERSEDED: ${{ steps.debounce.outputs.superseded }}
+        run: |
+          set -euo pipefail
+          proceed="true"; reason=""
+          if [ "${ALREADY_REVIEWED}" = "true" ]; then proceed="false"; reason="HEAD already reviewed"; fi
+          if [ "${IS_DRAFT}" = "true" ]; then proceed="false"; reason="PR is a draft"; fi
+          if [ "${PAUSED}" = "true" ]; then proceed="false"; reason="codex:pause label present"; fi
+          if [ "${SUPERSEDED}" = "true" ]; then proceed="false"; reason="superseded by a newer push (debounced)"; fi
+          echo "proceed=${proceed}" >> "$GITHUB_OUTPUT"
+          echo "reason=${reason}"   >> "$GITHUB_OUTPUT"
+          echo "proceed=${proceed} reason=${reason}"
 
       # ---------------------------------------------------------------
       # 4. Set up Node.js and install Codex CLI.
       # ---------------------------------------------------------------
       - name: Set up Node.js
-        if: steps.context.outputs.already_reviewed != 'true'
+        if: steps.gate.outputs.proceed == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: "24"
 
       - name: Install Codex CLI
-        if: steps.context.outputs.already_reviewed != 'true'
+        if: steps.gate.outputs.proceed == 'true'
         run: npm install -g @openai/codex@${{ inputs.codex_version }}
 
       # ---------------------------------------------------------------
@@ -241,7 +345,7 @@ jobs:
       # ---------------------------------------------------------------
       - name: Install project dependencies
         id: deps
-        if: steps.context.outputs.already_reviewed != 'true'
+        if: steps.gate.outputs.proceed == 'true'
         continue-on-error: true
         shell: bash
         env:
@@ -289,7 +393,7 @@ jobs:
       # 6. Enable unprivileged user namespaces for bubblewrap.
       # ---------------------------------------------------------------
       - name: Enable unprivileged user namespaces for bubblewrap
-        if: steps.context.outputs.already_reviewed != 'true'
+        if: steps.gate.outputs.proceed == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -308,7 +412,7 @@ jobs:
       #     and consuming repos carry no prompt of their own.
       # ---------------------------------------------------------------
       - name: Check out shared review prompt
-        if: steps.context.outputs.already_reviewed != 'true'
+        if: steps.gate.outputs.proceed == 'true'
         uses: actions/checkout@v4
         with:
           repository: modsy/ci-workflows
@@ -326,9 +430,44 @@ jobs:
       #    tells Codex to review only the incremental diff since that SHA
       #    rather than the full PR diff, avoiding re-raising stale issues.
       # ---------------------------------------------------------------
+      # ---------------------------------------------------------------
+      # 6c. Classify the increment. If every file changed since the last review
+      #     (or across the PR, when there is no prior review) is a test or docs
+      #     path, post summary-only: findings go in the body, no inline threads.
+      # ---------------------------------------------------------------
+      - name: Classify increment (docs/test-only)
+        id: classify
+        if: steps.gate.outputs.proceed == 'true'
+        shell: bash
+        env:
+          LAST_REVIEWED_SHA: ${{ steps.context.outputs.last_reviewed_sha }}
+        run: |
+          set -euo pipefail
+          if [ -n "${LAST_REVIEWED_SHA:-}" ]; then
+            range="${LAST_REVIEWED_SHA}...HEAD^2"
+          else
+            range="HEAD^1...HEAD^2"
+          fi
+          files="$(git diff --name-only "${range}" 2>/dev/null || true)"
+          summary_only="false"
+          if [ -n "$files" ]; then
+            # Any path that is neither a test nor a docs file disqualifies
+            # summary-only mode.
+            non_testdoc="$(printf '%s\n' "$files" | grep -vE \
+              '(^|/)(tests?|__tests__|specs?)/|(\.(test|spec)\.[jt]sx?)$|(^|/)test_[^/]*\.py$|(_test\.(py|go))$|(\.(md|mdx|rst|txt))$|(^|/)docs?/' \
+              || true)"
+            if [ -z "$non_testdoc" ]; then
+              summary_only="true"
+            fi
+          fi
+          echo "summary_only=${summary_only}" >> "$GITHUB_OUTPUT"
+          echo "Increment range: ${range}"
+          printf 'Changed files:\n%s\n' "$files"
+          echo "summary_only=${summary_only}"
+
       - name: Run Codex PR review
         id: codex
-        if: steps.context.outputs.already_reviewed != 'true'
+        if: steps.gate.outputs.proceed == 'true'
         shell: bash
         env:
           CODEX_ACCESS_TOKEN: ${{ secrets.CODEX_ACCESS_TOKEN }}
@@ -455,13 +594,18 @@ jobs:
       # ---------------------------------------------------------------
       - name: Post Codex review
         id: post_review
-        if: always() && steps.codex.outcome != 'skipped' && steps.codex.outcome != 'failure'
+        if: >-
+          always() && steps.gate.outputs.proceed == 'true' &&
+          steps.codex.outcome != 'skipped' && steps.codex.outcome != 'failure'
         uses: actions/github-script@v7
         env:
           PR_NUMBER: ${{ steps.pr.outputs.number }}
           HEAD_SHA: ${{ steps.context.outputs.head_sha }}
           REVIEWED_SHA: ${{ steps.context.outputs.reviewed_sha }}
           RUNNER_TEMP_PATH: ${{ runner.temp }}
+          INLINE_MIN_SEVERITY: ${{ inputs.inline_min_severity }}
+          MAX_INLINE_COMMENTS: ${{ inputs.max_inline_comments }}
+          SUMMARY_ONLY: ${{ steps.classify.outputs.summary_only }}
         with:
           github-token: ${{ github.token }}
           script: |
@@ -552,9 +696,20 @@ jobs:
               }
             }
 
-            // ── Split: inline vs body-only, suppressing duplicates ───────────
-            const inlineComments   = [];
-            const bodyOnlyFindings = [];
+            // ── Noise controls: severity floor, cap, summary-only ────────────
+            // Only findings at or above the floor open inline threads; the rest
+            // are listed in the body. A docs/test-only increment posts entirely
+            // in the body. The inline set is capped so one push cannot spawn a
+            // wall of threads; overflow is listed too.
+            const SEV_RANK = { blocking: 3, suggestion: 2, nitpick: 1 };
+            const minSevRaw = String(process.env.INLINE_MIN_SEVERITY || "suggestion").toLowerCase();
+            const floor = SEV_RANK[minSevRaw] ?? SEV_RANK.suggestion;
+            const maxInline = Number(process.env.MAX_INLINE_COMMENTS) || 10;
+            const summaryOnly = process.env.SUMMARY_ONLY === "true";
+
+            const inlineCandidates = []; // {path, line, side, body, rank}
+            const minorNotes       = []; // below the floor, or summary-only mode
+            const nonDiffFindings  = []; // at/above floor but line not in diff
             let suppressedCount    = 0;
 
             for (const c of rawComments) {
@@ -568,18 +723,43 @@ jobs:
                 continue;
               }
 
+              const sev  = String(c.severity || "suggestion").toLowerCase();
+              const rank = SEV_RANK[sev] ?? SEV_RANK.suggestion;
+
+              // Below the floor, or a docs/test-only increment: never a thread.
+              if (summaryOnly || rank < floor) {
+                minorNotes.push(`**\`${c.path}:${c.line}\`** (${sev}): ${c.body}`);
+                continue;
+              }
+
+              // At/above floor: inline if the line is in the diff, else body.
               if (commentableLines[c.path]?.has(c.line)) {
-                inlineComments.push({
-                  path: c.path, line: c.line, side: "RIGHT", body: c.body,
+                inlineCandidates.push({
+                  path: c.path, line: c.line, side: "RIGHT", body: c.body, rank,
                 });
               } else {
-                bodyOnlyFindings.push(`**\`${c.path}:${c.line}\`** — ${c.body}`);
+                nonDiffFindings.push(`**\`${c.path}:${c.line}\`**: ${c.body}`);
               }
             }
+
+            // Cap inline threads: keep the highest-severity findings inline,
+            // list the overflow in the body.
+            inlineCandidates.sort((a, b) => b.rank - a.rank);
+            const inlineComments = inlineCandidates
+              .slice(0, maxInline)
+              .map(({ path, line, side, body }) => ({ path, line, side, body }));
+            const overflowFindings = inlineCandidates
+              .slice(maxInline)
+              .map((c) => `**\`${c.path}:${c.line}\`**: ${c.body}`);
 
             if (suppressedCount > 0) {
               core.info(`Suppressed ${suppressedCount} duplicate finding(s) from prior reviews.`);
             }
+            core.info(
+              `Inline: ${inlineComments.length}, minor: ${minorNotes.length}, ` +
+              `non-diff: ${nonDiffFindings.length}, overflow: ${overflowFindings.length}, ` +
+              `summaryOnly: ${summaryOnly}, floor: ${minSevRaw}`
+            );
 
             // ── Build review body ────────────────────────────────────────────
             // The review is always posted as a non-blocking COMMENT; surface the
@@ -618,15 +798,21 @@ jobs:
             let body = `<!-- codex-reviewer -->`;
             if (sha) body += `\n_Codex review of \`${sha}\`_`;
             body += `\n\n**Verdict:** ${verdictNote} — ${findingsLine} _(advisory; never blocks merge)_`;
+            if (summaryOnly) {
+              body += `\n\n_Changes since the last review are docs/test-only; posted as summary notes, no inline threads._`;
+            }
             body += `\n\n${(review.summary || "").trim()}`;
             if (suppressedCount > 0) {
               body += `\n\n_${suppressedCount} finding(s) suppressed — already raised in a prior review._`;
             }
-            if (bodyOnlyFindings.length > 0) {
-              body +=
-                "\n\n---\n\n**Findings on non-diff lines:**\n" +
-                bodyOnlyFindings.map((f) => `- ${f}`).join("\n");
-            }
+            const section = (title, items) =>
+              items.length ? `\n\n---\n\n**${title}:**\n` + items.map((f) => `- ${f}`).join("\n") : "";
+            // Minor notes: below the inline severity floor (or summary-only mode).
+            body += section("Minor notes", minorNotes);
+            // Findings on lines not present in the diff (cannot anchor inline).
+            body += section("Findings on non-diff lines", nonDiffFindings);
+            // Overflow beyond the inline cap.
+            body += section(`Additional findings (over the inline limit of ${maxInline})`, overflowFindings);
             if (body.length > MAX_BODY) {
               body = body.slice(0, MAX_BODY - 50) + "\n\n_[truncated]_";
             }
@@ -661,13 +847,14 @@ jobs:
         env:
           REVIEW_URL: ${{ steps.post_review.outputs.review_url }}
           CODEX_OUTCOME: ${{ steps.codex.outcome }}
-          ALREADY_REVIEWED: ${{ steps.context.outputs.already_reviewed }}
+          PROCEED: ${{ steps.gate.outputs.proceed }}
+          SKIP_REASON: ${{ steps.gate.outputs.reason }}
         run: |
           {
             echo "## Codex PR Review"
             echo
-            if [ "${ALREADY_REVIEWED:-false}" = "true" ]; then
-              echo "Skipped: HEAD was already reviewed by a prior run."
+            if [ "${PROCEED:-true}" != "true" ]; then
+              echo "Skipped: ${SKIP_REASON:-not eligible for review}."
             elif [ "$CODEX_OUTCOME" = "success" ] && [ -n "${REVIEW_URL:-}" ]; then
               echo "Review posted: $REVIEW_URL"
             elif [ "$CODEX_OUTCOME" = "failure" ]; then
