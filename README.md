@@ -19,13 +19,17 @@ improvements:
 - **Codebase-aware.** A single stack-agnostic prompt (bundled here) detects the language
   and reads your repo's own `AGENTS.md` / `CLAUDE.md` / `.agents/rules/` for conventions.
 - **Never blocks.** The review is always posted as a non-blocking `COMMENT`. The model's
-  verdict is shown as advisory text (`Verdict: Changes suggested — 2 issues · 1 suggestion`),
+  verdict is shown as advisory text (`Verdict: Changes suggested, 2 issues, 1 suggestion`),
   so resolving threads is clean and nothing wedges your merge.
+- **Low noise.** It reviews only what changed since its last pass, debounces a burst of
+  pushes into one review, opens inline threads only for findings at or above a severity
+  floor (nitpicks go in the body by default), caps inline threads per run, and pauses on
+  draft or a `codex:pause` label. See "Reducing thread churn" below.
 - **Consistent comments.** [Conventional Comments](https://conventionalcomments.org)
   (`issue` / `suggestion` / `nitpick`), each with a one-line subject, a required *why*,
   and a concrete fix. No emoji.
 - **Maintained centrally.** Change the review behavior for every repo by editing the
-  prompt here — not by touching each consumer.
+  prompt here, not by touching each consumer.
 
 ---
 
@@ -57,14 +61,17 @@ permissions:
   pull-requests: write
   issues: write
 
+# The reusable workflow manages its own per-PR concurrency and debounce, so a
+# caller-level concurrency block is optional. This one cancels superseded caller
+# runs early to save minutes on a burst of pushes.
 concurrency:
   group: codex-pr-review-${{ github.event.pull_request.number }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   codex-review:
     # Same-repo guard: never runs for fork PRs, keeping credentials away from
-    # untrusted code. (Don't add workflow_dispatch — an arbitrary PR number
+    # untrusted code. (Don't add workflow_dispatch: an arbitrary PR number
     # would bypass this guard.)
     if: >-
       github.event.pull_request.head.repo.full_name == github.repository &&
@@ -87,16 +94,23 @@ prompt** — it's bundled here and applied to every caller.
 2. The workflow:
    - Checks out the PR merge commit (`persist-credentials: false`, so the token can't
      push or fetch).
-   - Fetches PR metadata, the diff, and any linked issues for context.
-   - **Auto-installs dependencies** by detecting a root manifest — `package-lock.json` →
+   - Fetches PR metadata and any linked issues for context. Codex runs the `git diff`
+     itself against the checkout; the diff is not pasted into the prompt.
+   - **Decides whether to review.** Skips if this exact HEAD was already reviewed, if the
+     PR is a draft, or if it carries `codex:pause`. Otherwise it debounces: it pauses
+     briefly and exits if a newer commit has landed, so a burst of pushes collapses to one
+     review. When a prior review exists, it reviews only the increment since that commit.
+   - **Auto-installs dependencies** by detecting a root manifest: `package-lock.json` →
      `npm ci` (and builds workspaces if it's a monorepo), `yarn.lock` / `pnpm-lock.yaml`,
      `uv.lock` → `uv sync`, `requirements.txt` / `pyproject.toml` → pip, `go.mod` →
      `go mod download`. Best-effort and `continue-on-error`: if it can't install, the
      review still runs statically.
    - Loads the review prompt from **this repo** (version-locked to the workflow's own
-     commit) — never from the PR under review.
+     commit), never from the PR under review.
    - Runs the Codex CLI in an ephemeral sandbox and parses its JSON output.
-   - Posts a single non-blocking `COMMENT` review with inline diff comments.
+   - Posts a single non-blocking `COMMENT` review. Findings at or above the severity floor
+     open inline threads (capped per run and deduped against prior bot comments);
+     lower-severity, overflow, non-diff, and docs/test-only findings are listed in the body.
 
 ---
 
