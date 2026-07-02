@@ -171,6 +171,78 @@ uses: modsy/ci-workflows/.github/workflows/codex-pr-review.yml@<sha>
 | Dependencies not installed | Auto-detect is best-effort. For a nested monorepo package, set `pre_install_command` to your install command. |
 | Fork PRs not reviewed | Intentional — the same-repo guard keeps secrets away from fork code. |
 
+---
+
+## `secret-scan`: block secrets and flag PII on every PR
+
+A CI-side gate that stops hardcoded secrets (API keys, tokens, private keys,
+connection strings) from merging, and optionally flags likely PII/PHI for human
+review. It complements, and does not replace, pre-commit hooks: a pre-commit hook is
+skipped by `--no-verify`, IDE commits, and web/API pushes, so this workflow
+catches everything that actually reaches the PR.
+
+- **Zero config, stack-agnostic.** One small caller. `gitleaks` runs from a
+  directly-downloaded binary (no marketplace action, no license key that org
+  accounts otherwise need).
+- **Diff-scoped by default.** Scans only the commits the PR introduces, so a
+  pre-existing finding on the base branch does not fail your PR. Set
+  `scan_scope: full` for a one-time history audit.
+- **Blocks by default, deliberately.** Unlike the advisory code reviewer, a
+  detected secret fails the check (`fail_on_secrets: true`). Set it false for
+  report-only mode. Values are redacted in logs and the PR comment.
+- **Advisory PII sweep (opt-in).** `scan_pii: true` adds a high-confidence
+  email/SSN/phone regex pass over added lines. It NEVER blocks the merge,
+  regex PII detection is false-positive-prone. True PHI coverage needs a
+  dedicated service and is out of scope for a dependency-free gate.
+- **One comment, upserted.** Results post to a single marker-tagged PR comment
+  that updates in place, so pushes do not pile up duplicates.
+
+### Caller
+
+```yaml
+name: Secret Scan
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  secret-scan:
+    if: github.event.pull_request.draft == false
+    uses: modsy/ci-workflows/.github/workflows/secret-scan.yml@main
+    with:
+      scan_scope: "diff"       # or "full"
+      fail_on_secrets: true    # false for report-only
+      # scan_pii: true         # advisory email/SSN/phone sweep
+      # gitleaks_config: ".gitleaks.toml"  # repo-specific rules / allowlist
+```
+
+No secret needs to be configured. See `examples/secret-scan.yml` and
+`examples/secret-scan-with-fork-guard.yml`.
+
+### Inputs
+
+| Input | Default | Purpose |
+|---|---|---|
+| `scan_scope` | `"diff"` | `diff` scans the PR's commits; `full` scans all history on the head. |
+| `fail_on_secrets` | `true` | Fail (block) on a secret finding, or report-only when false. |
+| `scan_pii` | `false` | Enable the advisory PII sweep. Never blocks regardless of `fail_on_secrets`. |
+| `gitleaks_config` | `""` | Path to a custom `.gitleaks.toml` for repo-specific rules or allowlists. |
+| `gitleaks_version` | pinned | gitleaks release to install. Bump deliberately. |
+
+### Custom rules and false positives
+
+Point `gitleaks_config` at a `.gitleaks.toml` in your repo to add rules (e.g.
+Django `SECRET_KEY`, `VITE_`-prefixed vars, an internal token format) or to
+allowlist known test fixtures. Inline `gitleaks:allow` comments and a
+`.gitleaksignore` file also suppress specific findings.
+
+---
+
 ## Contributing
 
 Maintained by the modsy platform team. Open a PR for changes that benefit consuming teams,
